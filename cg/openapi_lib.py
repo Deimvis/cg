@@ -1,8 +1,11 @@
 import subprocess as sp
 import os
+import urllib.parse
 import yaml
 from enum import Enum
 from pathlib import Path
+
+from . import remote
 
 # TODO: support redefining settings for whole file, or for models matching regex in this file
 # TODO: emergent
@@ -41,12 +44,13 @@ from pathlib import Path
 MODELS = Path.cwd() / 'src/models'
 MODELS_TMP = Path.cwd() / 'tmp/models'
 
-VOLUMES = [
-    # custom:
+VOLUMES: list[tuple[Path | str, Path]] = [
+    # custom; each entry is (src, dst) where `src` is a local Path or a URL string
+    # prefix (http(s)://...), and `dst` is the local output directory Path.
    ((Path.cwd() / 'docs/openapi/definitions'), MODELS),
 ]
 
-DEFAULT_VOLUME = {
+DEFAULT_VOLUME: dict[Path, Path] = {
     (Path.cwd() / 'docs/openapi'): MODELS / 'api',
 }
 
@@ -82,6 +86,77 @@ def _find_git_root_fp(fp: Path) -> Path:
 def with_extension(fp: Path, ext: str) -> Path:
     return fp.parent / (CODEGEN_FILE_NAME_PREFIX + fp.stem + CODEGEN_FILE_NAME_SUFFIX + ext)
 
+def _url_parents(url: str) -> list[str]:
+    """Return URL prefixes from deepest to shallowest, e.g.
+    https://x/a/b/c.yaml -> [https://x/a/b, https://x/a, https://x]."""
+    parsed = urllib.parse.urlparse(url)
+    parts = [p for p in parsed.path.split('/') if p]
+    if not parts:
+        return []
+    out = []
+    for i in range(len(parts) - 1, 0, -1):
+        prefix_path = '/' + '/'.join(parts[:i])
+        out.append(urllib.parse.urlunparse(parsed._replace(path=prefix_path)))
+    out.append(urllib.parse.urlunparse(parsed._replace(path='')))
+    return out
+
+
+def _url_relative(url: str, prefix: str) -> str:
+    """Return the path of `url` relative to URL prefix `prefix`. Both must
+    share scheme+netloc and `url` must be under `prefix`."""
+    p_url = urllib.parse.urlparse(url)
+    p_prefix = urllib.parse.urlparse(prefix)
+    if (p_url.scheme, p_url.netloc) != (p_prefix.scheme, p_prefix.netloc):
+        raise ValueError(f'{url!r} is not under {prefix!r}')
+    url_path = p_url.path.rstrip('/')
+    prefix_path = p_prefix.path.rstrip('/')
+    if not url_path.startswith(prefix_path + '/'):
+        raise ValueError(f'{url!r} is not under {prefix!r}')
+    return url_path[len(prefix_path) + 1:]
+
+
+def _match_volume(openapi_fp: Path) -> tuple[Path, Path] | None:
+    """Pick the closest matching volume for `openapi_fp` and return
+    (relative_source, output_dir) where `relative_source` is the file
+    path relative to the volume's source root. Returns None if nothing matches."""
+    source_url = remote.url_of_cache_path(openapi_fp)
+
+    matches: list[tuple[int, Path, str]] = []  # (distance, output_dir, relative_source_str)
+
+    if source_url is not None:
+        url_parents = _url_parents(source_url)
+        for src, output_dir in VOLUMES:
+            if not isinstance(src, str):
+                continue
+            for i, parent in enumerate(url_parents):
+                if parent.rstrip('/') == src.rstrip('/'):
+                    rel = _url_relative(source_url, src)
+                    matches.append((i, output_dir, rel))
+                    break
+    else:
+        for src, output_dir in VOLUMES:
+            if not isinstance(src, Path):
+                continue
+            for i in range(len(openapi_fp.parents)):
+                if openapi_fp.parents[i] == src:
+                    rel = str(openapi_fp.relative_to(src))
+                    matches.append((i, output_dir, rel))
+                    break
+        if not matches:
+            for src, output_dir in DEFAULT_VOLUME.items():
+                for i in range(len(openapi_fp.parents)):
+                    if openapi_fp.parents[i] == src:
+                        rel = str(openapi_fp.relative_to(src))
+                        matches.append((i, output_dir, rel))
+                        break
+
+    if not matches:
+        return None
+    matches.sort(key=lambda m: m[0])
+    _, output_dir, rel = matches[0]
+    return Path(rel), output_dir
+
+
 def get_out_fp(openapi_fp: Path) -> Path:
     # TODO: recursively regenerate each dependency (openapi fp)
     #       Use explicit destinations specifiedd inside openapi fp when exists (must specify main that will be included by others or default resolve policy: import closest from file who requested this definition)
@@ -114,25 +189,16 @@ def get_out_fp(openapi_fp: Path) -> Path:
     if 'schemas' not in content['components']:
         return
 
-
-    matches = []
-    for input_dir, output_dir in VOLUMES:
-        for i in range(len(openapi_fp.parents)):
-            if openapi_fp.parents[i] == input_dir:
-                matches.append((i, input_dir, output_dir)) # (dist, input_dir)
-
-    closest_volume = None
-    if len(matches) == 0:
-        closest_volume = list(DEFAULT_VOLUME.items())[0]
-    else:
-        matches.sort()
-        closest_input_dir = matches[0][1]
-        output_dir = matches[0][2]
-        closest_volume = (closest_input_dir, output_dir)
-
-    openapi_rel_fp = openapi_fp.relative_to(closest_volume[0])
-    output_fp = with_extension(closest_volume[1] / openapi_rel_fp, '.go')
-    return output_fp
+    match = _match_volume(openapi_fp)
+    if match is None:
+        source_repr = remote.url_of_cache_path(openapi_fp) or str(openapi_fp)
+        raise SystemExit(
+            f'no volume matches source file {source_repr!r}; '
+            f'pass --volume <src>:<dst> (src may be a local directory or a URL prefix) '
+            f'to specify where its output should be written'
+        )
+    rel_source, output_dir = match
+    return with_extension(output_dir / rel_source, '.go')
 
 
 
@@ -340,22 +406,48 @@ def get_def_schema(openapi_fp: Path, def_path: list[str]) -> dict:
         node = node[p]
     return node
 
-def generate_golang_definition_ref(openapi_fp: Path, ref_value: str) -> tuple[str, str]:
-    ref_rel_fp_raw, def_path = ref_value.split('#/')
-    if ref_rel_fp_raw == '':
-        ref_fp = openapi_fp
+def _resolve_ref_target(openapi_fp: Path, ref_target: str) -> Path:
+    """Resolve the file portion of a $ref relative to `openapi_fp`. The target
+    may be a local relative path or an absolute http(s) URL. If `openapi_fp`
+    itself originated from a URL and the target is a relative path, the
+    target is resolved against the source URL."""
+    if ref_target == '':
+        return openapi_fp
+    if remote.is_url(ref_target):
+        return remote.fetch(ref_target)
+    source_url = remote.url_of_cache_path(openapi_fp)
+    if source_url is not None:
+        joined = urllib.parse.urljoin(source_url, ref_target)
+        return remote.fetch(joined)
+    return (openapi_fp.parent / ref_target).resolve()
+
+
+def _parse_ref(ref_value: str) -> tuple[str, list[str]]:
+    """Split a $ref into (target, def_path_parts). Accepts both `target#/a/b/c`
+    and the shorthand `target#Name` (treated as `components/schemas/Name`)."""
+    if '#' not in ref_value:
+        raise SystemExit(f'$ref missing fragment: {ref_value!r}')
+    target, fragment = ref_value.split('#', 1)
+    if fragment.startswith('/'):
+        def_path = [p for p in fragment[1:].split('/') if p]
     else:
-        ref_fp = (openapi_fp.parent / ref_rel_fp_raw).resolve()
+        def_path = ['components', 'schemas', fragment]
+    return target, def_path
+
+
+def generate_golang_definition_ref(openapi_fp: Path, ref_value: str) -> tuple[str, str]:
+    ref_target, def_path = _parse_ref(ref_value)
+    ref_fp = _resolve_ref_target(openapi_fp, ref_target)
     if ref_fp not in PROCESSED_FILES:
         PROCESSED_FILES.append(ref_fp)
         handle_definitions_file(ref_fp, get_out_fp(ref_fp), ProgrammingLanguage.Golang)
 
-    ref_schema = get_def_schema(ref_fp, def_path.split('/'))
+    ref_schema = get_def_schema(ref_fp, def_path)
     tags = ''
     if 'x-vk-go-extra-tags' in ref_schema:
         tags += ' ' + ref_schema['x-vk-go-extra-tags']
 
-    def_name = _camel_case(def_path.split('/')[-1])
+    def_name = _camel_case(def_path[-1])
     if 'x-vk-go-def-name' in ref_schema:
         def_name = ref_schema['x-vk-go-def-name']
     go_rel_def_name = ''
@@ -465,7 +557,11 @@ def handle_definitions_file(openapi_fp: Path, output_fp: Path, output_lang: Prog
                 ] + [f'\t{name},' for name in enum_const_names] + ['}']
                 vars_groups.append('\n'.join(aggregated_lines))
 
-    header = CODEGEN_FILE_HEADER + f' (source: {openapi_fp.absolute().relative_to(_find_git_root_fp(openapi_fp))})'
+    source_url = remote.url_of_cache_path(openapi_fp)
+    if source_url is not None:
+        header = CODEGEN_FILE_HEADER + f' (source: {source_url})'
+    else:
+        header = CODEGEN_FILE_HEADER + f' (source: {openapi_fp.absolute().relative_to(_find_git_root_fp(openapi_fp))})'
     write_file(output_fp, '\n\n'.join(defs+ vars_groups), header=header)
 
 

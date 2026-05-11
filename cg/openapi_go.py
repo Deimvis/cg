@@ -3,7 +3,7 @@ from pathlib import Path
 
 import yaml
 
-from . import openapi_lib
+from . import openapi_lib, remote
 from .openapi_lib import (
     GENERATED_OUT_FILES,
     ProgrammingLanguage,
@@ -28,8 +28,8 @@ def _gofmt(*paths: Path) -> None:
 def run_api(
     input_file: Path,
     output_dir: Path,
-    volumes: list[tuple[Path, Path]] | None = None,
-    extra: list[Path] | None = None,
+    volumes: list[tuple[Path | str, Path]] | None = None,
+    extra: list[Path | str] | None = None,
     output_basename_suffix: str | None = None,
 ) -> None:
     assert input_file.is_file()
@@ -44,8 +44,12 @@ def run_api(
 
     if extra:
         for p in extra:
-            assert p.is_file()
-            fp = p.absolute()
+            if isinstance(p, str) and remote.is_url(p):
+                fp = remote.fetch(p)
+            else:
+                fp = Path(p) if not isinstance(p, Path) else p
+                assert fp.is_file()
+                fp = fp.absolute()
             handle_definitions_file(fp, get_out_fp(fp), ProgrammingLanguage.Golang)
 
     _gofmt(output_dir.absolute())

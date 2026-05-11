@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from . import openapi_go, sql_tests_go
+from . import openapi_go, remote, sql_tests_go
 
 
 SRC_OPENAPI = "openapi"
@@ -11,21 +11,21 @@ DST_GO = "go"
 DST_GO_TESTS = "go/tests"
 
 
-def _parse_volumes(raw: list[str] | None) -> list[tuple[Path, Path]]:
+def _parse_volumes(raw: list[str] | None) -> list[tuple[Path | str, Path]]:
     if not raw:
         return []
-    out: list[tuple[Path, Path]] = []
-    for v in raw:
-        src, dst = v.split(":")
-        out.append((Path.cwd() / src, Path.cwd() / dst))
-    return out
+    return [remote.parse_volume(v) for v in raw]
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cg", description="codegen entrypoint")
     p.add_argument("--src-type", required=True, choices=[SRC_OPENAPI, SRC_SQL])
     p.add_argument("--dst-type", required=True, choices=[DST_GO, DST_GO_TESTS])
-    p.add_argument("input", type=Path, help="Input file or directory")
+    p.add_argument(
+        "input",
+        type=str,
+        help="Input file or directory (openapi also accepts http(s) URLs)",
+    )
     p.add_argument(
         "-o",
         "--output",
@@ -37,17 +37,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "-v",
         "--volume",
         type=str,
-        nargs="*",
-        action="extend",
-        help="Volumes in form `src:dst` for openapi codegen",
+        action="append",
+        default=[],
+        help="Volume in form `src:dst` for openapi codegen (repeat for multiple)",
     )
     p.add_argument(
         "-e",
         "--extra",
         type=str,
-        nargs="*",
-        action="extend",
-        help="Extra openapi definition files to process",
+        action="append",
+        default=[],
+        help="Extra openapi definition file to process (repeat for multiple)",
     )
     p.add_argument(
         "--output-basename-suffix",
@@ -62,12 +62,18 @@ def _run_openapi(args: argparse.Namespace) -> None:
     if args.dst_type != DST_GO:
         raise SystemExit(f"--dst-type {args.dst_type} is not supported for openapi (use {DST_GO})")
 
-    input_file: Path = args.input
-    if not input_file.is_file():
-        raise SystemExit(f"input must be a file: {input_file}")
+    raw_input: str = args.input
+    if remote.is_url(raw_input):
+        input_file = remote.fetch(raw_input)
+    else:
+        input_file = Path(raw_input)
+        if not input_file.is_file():
+            raise SystemExit(f"input must be a file: {input_file}")
 
     volumes = _parse_volumes(args.volume)
-    extra = [Path(p) for p in (args.extra or [])]
+    extra: list[Path | str] = [
+        p if remote.is_url(p) else Path(p) for p in (args.extra or [])
+    ]
 
     output: Path | None = args.output
     if output is not None and output.is_dir():
@@ -98,7 +104,9 @@ def _run_sql(args: argparse.Namespace) -> None:
         raise SystemExit(f"--dst-type {args.dst_type} is not supported for sql (use {DST_GO_TESTS})")
     if args.output is None:
         raise SystemExit("sql codegen requires -o/--output <output_file>")
-    sql_dir: Path = args.input
+    if remote.is_url(args.input):
+        raise SystemExit("sql codegen requires a local directory; URLs are not supported")
+    sql_dir = Path(args.input)
     if not sql_dir.is_dir():
         raise SystemExit(f"input must be a directory for sql codegen: {sql_dir}")
     sql_tests_go.run(sql_dir=sql_dir, output_file=args.output)
