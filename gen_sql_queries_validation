@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+
+import logging
+import subprocess as sp
+import sys
+from pathlib import Path
+
+
+
+CODEGEN_FILE_HEADER = '// THIS CODE IS GENERATED - DO NOT CHANGE IT'
+CODEGEN_DEPS = '''
+func validateSyntax(query string) error {
+	if strings.Contains(query, "$$") {
+		return nil
+	}
+	validateQuery := fmt.Sprintf(`
+		DO $SYNTAX_CHECK$ BEGIN RETURN;
+		%s;
+		END; $SYNTAX_CHECK$;`,
+		query)
+	_, err := setup.PG.Exec(context.Background(), validateQuery)
+	return err
+}
+
+func validate(sqlQuery string, msgAndArgs ...interface{}) func() error {
+	return func() error {
+		for i, query := range xmust.Do(xsql.ParseQueries(sqlQuery)) {
+			err := validateSyntax(query)
+			if err != nil {
+				msg := xfmt.Sprintfg(msgAndArgs...)
+				return fmt.Errorf("%s (query #%d): %w", msg, i+1, err)
+			}
+		}
+		return nil
+	}
+}
+'''
+
+INPUT_DIR_FP = Path('sql/').absolute()
+OUTPUT_FP = Path(sys.argv[1])
+
+
+def _split_words(s: str) -> list[str]:
+    words = []
+    buf = ''
+    for c in s:
+        if c in ['_', '-']:
+           words.append(buf)
+           buf = ''
+        elif c.isupper():
+            words.append(buf)
+            buf = c
+        else:
+            buf += c    
+    if len(buf) > 0:
+        words.append(buf)
+    return words
+
+
+def _camel_case(s: str) -> str:
+    result = ''.join(w.capitalize() for w in _split_words(s))
+    # hack for abbreviations
+    if 'Abc' in result:
+        result = result.replace('Abc', 'ABC')
+    if 'Vk' in result:
+        result = result.replace('Vk', 'VK')
+    if 'Acl' in result:
+        result = result.replace('Acl', 'ACL')
+    if 'Md5' in result:
+        result = result.replace('Md5', 'MD5')
+    if 'Ttl' in result:
+        result = result.replace('Ttl', 'TTL')
+    if 'Eq' == result:
+        result = 'EQ'
+    if 'Ge' == result:
+        result = 'GE'
+    if 'Le' == result:
+        result = 'LE'
+    return result
+
+
+def process_dir(p: Path) -> list[str]:
+    result = []
+    for child in p.iterdir():
+        if child.is_dir():
+            result.extend(process_dir(child))
+        elif child.is_file():
+            rel_fp = child.relative_to(INPUT_DIR_FP)
+            tr_ext = lambda p: p[:p.rfind('.')] if '.' in p else p
+            field_name = '.'.join(map(_camel_case, map(tr_ext, rel_fp.parts)))
+            code = f'validate(m.{field_name}, "{rel_fp}"),'
+            result.append(code)
+        else:
+            raise RuntimeError(f'Got unknown entity type: {child.absolute()}')
+    return result
+
+
+def main():
+    queryValidatesBody = '\n'.join(sorted(process_dir(INPUT_DIR_FP), key=lambda x: (-x.count('.'), x)))
+    code = f'''
+    {CODEGEN_FILE_HEADER}
+    package sql_tests
+
+    {CODEGEN_DEPS}
+
+    func queryValidates(m *sql.QueryManager) []func() error {{
+        return []func() error {{
+            {queryValidatesBody}
+        }}
+    }}
+    '''
+    logging.info(code)
+    with OUTPUT_FP.open('w') as f:
+        f.write(code)
+    sp.run(['gofmt', '-s', '-w', OUTPUT_FP.absolute()])    
+    sp.run(['goimports', '-w', OUTPUT_FP.absolute()])
+
+
+if __name__ == '__main__':
+    main()

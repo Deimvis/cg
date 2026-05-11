@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+import subprocess as sp
+from pathlib import Path
+
+import gen_models_lib
+from gen_models_lib import handle_definitions_file, ProgrammingLanguage, get_out_fp, GENERATED_OUT_FILES
+
+
+def main():
+    import sys
+    input_file = Path(sys.argv[1])
+    if len(sys.argv) > 2:
+        output_file = Path(sys.argv[2])
+        assert input_file.is_file()
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        gen_models_lib.DEFAULT_VOLUME = {}
+        output_file = get_out_fp(input_file)
+
+    handle_definitions_file(input_file, output_file, ProgrammingLanguage.Golang)
+
+    sp.run(['gofmt', '-s', '-w', output_file.parent.absolute()])
+    sp.run(['goimports', '-w', output_file.parent.absolute()])
+    
+    codegen_dirs = set(f.parent for f in GENERATED_OUT_FILES)
+    for d in codegen_dirs:
+        sp.run(['gofmt', '-s', '-w', d.absolute()])
+        sp.run(['goimports', '-w', d.absolute()])
+
+
+if __name__ == '__main__':
+    main()
+
