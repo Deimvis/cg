@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cg"
+version = "0.1.0"
+description = "Codegen CLI for openapi schemas and sql query validation tests"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+cg = "cg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cg*"]
