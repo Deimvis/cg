@@ -20,8 +20,8 @@ from . import remote
 # TODO: support generation of files in separate location and swapping current files to new only when validation check succeeds
 #       For golang: allow copying only module root, because import path consists module name, and on swapping module name should be changed
 #       Do not swap files if their content is same to help lsp do not lose index
-# TODO: support nestsed settings like: x-vk-go: { def: ... field-name: ... } it will be equivalent to x-vk-go-def: + x-vk-go-field-name: ...
-# TODO: support custom x-vk-go-obj-name (for renaming current object)
+# TODO: support nestsed settings like: x-cg-go: { def: ... field-name: ... } it will be equivalent to x-cg-go-def: + x-cg-go-field-name: ...
+# TODO: support custom x-cg-go-obj-name (for renaming current object)
 # TODO: support adding private fields to generated struct
 # TODO: support enum embedding with allOf (one enum embeds other enums). it should work with proper comparison of variables - ordinary golang embedding doesn't work this way.
 # TODO: somehow link request to response in codegen to allow validation that response refers to request
@@ -31,14 +31,14 @@ from . import remote
 # TODO: support pushing all API definitions into single file (handle_api_file -> into one file)
 # TODO: support comments generation from field descriptions or explicitly with language-specific rules (like write above or on the same line)
 # TODO: support yaml anchors (ensure swagger will work properly)
-# TODO: support x-vk-ignore: skip definition
+# TODO: support x-cg-ignore: skip definition
 # TODO: support description into comments convertion
-# TODO: support x-vk-short-uri-name: for uri parameters (like for /secrets/:id you want property to have name SecretId, but to be able to specify short name, in order to use it as uri tag: SecretId string `uri:"id"`)
+# TODO: support x-cg-short-uri-name: for uri parameters (like for /secrets/:id you want property to have name SecretId, but to be able to specify short name, in order to use it as uri tag: SecretId string `uri:"id"`)
 # TODO: support inline: doesn't generate separate struct, just inline everywhere it is used
 # TODO: support camel case for abbreviations
-# TODO: support x-vk-go-field-name
-# TODO: support x-vk-go-def
-# TODO: do not create files that do not have effective schemas (e.g. when all schemas were replaced with x-vk-go-def)
+# TODO: support x-cg-go-field-name
+# TODO: support x-cg-go-def
+# TODO: do not create files that do not have effective schemas (e.g. when all schemas were replaced with x-cg-go-def)
 
 
 MODELS = Path.cwd() / 'src/models'
@@ -62,6 +62,37 @@ CODEGEN_FILE_NAME_PREFIX = ''
 CODEGEN_FILE_NAME_SUFFIX = '.cg'
 
 FW_IMPORT_PATH = os.environ.get('FW_IMPORT_PATH', 'github.com/Deimvis-go/fw')
+
+# Prefixes for custom openapi extension properties (e.g. `x-cg-go-def`,
+# `x-cg-header`). The first prefix is the canonical one used in error messages;
+# the remaining prefixes are aliases accepted on input. Override with the
+# comma-separated `CG_OPENAPI_PROPERTY_PREFIX` env var, e.g. `x-cg,x-vk`.
+PROP_PREFIXES: list[str] = [
+    p.strip() for p in os.environ.get('CG_OPENAPI_PROPERTY_PREFIX', 'x-cg').split(',') if p.strip()
+] or ['x-cg']
+
+
+_MISSING = object()
+
+
+def prop_get(schema: dict, suffix: str, default=None):
+    """Return the value of the first `<prefix>-<suffix>` key present in `schema`,
+    trying each configured prefix in order. Returns `default` if none match."""
+    for prefix in PROP_PREFIXES:
+        key = f'{prefix}-{suffix}'
+        if key in schema:
+            return schema[key]
+    return default
+
+
+def prop_in(schema: dict, suffix: str) -> bool:
+    return prop_get(schema, suffix, _MISSING) is not _MISSING
+
+
+def prop_canonical(suffix: str) -> str:
+    """Canonical form of the property name, using the first configured prefix.
+    For error messages and docs."""
+    return f'{PROP_PREFIXES[0]}-{suffix}'
 
 PROCESSED_FILES = []
 GENERATED_OUT_FILES = []
@@ -173,9 +204,10 @@ def get_out_fp(openapi_fp: Path) -> Path:
     assert openapi_fp.suffix == '.yaml'
     with openapi_fp.open('r') as f:
         content = yaml.safe_load(f)
-    if 'x-vk-header' in content:
-        if 'explicit_codegen_destinations' in content['x-vk-header']:
-            ecds = content['x-vk-header']['explicit_codegen_destinations']
+    header = prop_get(content, 'header')
+    if header is not None:
+        if 'explicit_codegen_destinations' in header:
+            ecds = header['explicit_codegen_destinations']
             # TODO: support other lang
             if 'golang' in ecds and len(ecds['golang']) > 0:
                 # TODO: support multiple destinations
@@ -336,8 +368,9 @@ def _generate_golang_definition_object_fields(openapi_fp: Path, openapi_schema: 
         for subs in s['allOf']:
             if '$ref' in subs:
                 ref_def, extra_tags = generate_golang_definition_ref(openapi_fp, subs['$ref'])
-                if 'x-vk-go-def' in subs:
-                    ref_def = subs['x-vk-go-def'].rstrip('\n')
+                go_def_override = prop_get(subs, 'go-def')
+                if go_def_override is not None:
+                    ref_def = go_def_override.rstrip('\n')
                 fields.append(' '*4 + f'{ref_def} {extra_tags}')
                 continue
             fields.extend(_generate_golang_definition_object_fields(openapi_fp, subs))
@@ -345,9 +378,10 @@ def _generate_golang_definition_object_fields(openapi_fp: Path, openapi_schema: 
 
     if '$ref' in s:
         ref_def, extra_tags = generate_golang_definition_ref(openapi_fp, s['$ref'])
-        if 'x-vk-go-extra-tags' in s:
+        extra_tags_override = prop_get(s, 'go-extra-tags')
+        if extra_tags_override is not None:
             # TODO: merge tags properly
-            extra_tags = s['x-vk-go-extra-tags'] + ' ' + extra_tags
+            extra_tags = extra_tags_override + ' ' + extra_tags
         return [f'{ref_def} {extra_tags}']
 
     if 'properties' not in s:
@@ -362,14 +396,13 @@ def _generate_golang_definition_object_fields(openapi_fp: Path, openapi_schema: 
         is_required = name in required_props
         if not is_required:
             prop_def = _apply_optional_policy(prop_def, schema)
-        field_name = _camel_case(name)
-        if 'x-vk-go-field-name' in schema:
-            field_name = schema['x-vk-go-field-name']
+        field_name = prop_get(schema, 'go-field-name', _camel_case(name))
         prop_def_lines = prop_def.split('\n')
         prop_def_lines[0] = f'{field_name} {prop_def_lines[0]}'
         tags = f'json:"{name}"'
-        if 'x-vk-go-extra-tags' in schema:
-            tags += ' ' + schema['x-vk-go-extra-tags']
+        field_extra_tags = prop_get(schema, 'go-extra-tags')
+        if field_extra_tags is not None:
+            tags += ' ' + field_extra_tags
         if ___extra_tags is not None:
             tags += ' ' + ___extra_tags
         prop_def_lines[-1] = f'{prop_def_lines[-1]} `{tags}`'
@@ -381,8 +414,9 @@ def _generate_golang_definition_object_fields(openapi_fp: Path, openapi_schema: 
 
 def generate_golang_definition_object(openapi_fp: Path, openapi_schema: dict) -> str:
     s = openapi_schema
-    if 'x-vk-go-def' in s:
-        return s['x-vk-go-def'].rstrip('\n')
+    go_def_override = prop_get(s, 'go-def')
+    if go_def_override is not None:
+        return go_def_override.rstrip('\n')
     if 'properties' not in openapi_schema and '$ref' not in openapi_schema and 'allOf' not in openapi_schema:
         value_type = 'interface{}'
         if 'additionalProperties' in s and isinstance(s['additionalProperties'], dict):
@@ -444,12 +478,11 @@ def generate_golang_definition_ref(openapi_fp: Path, ref_value: str) -> tuple[st
 
     ref_schema = get_def_schema(ref_fp, def_path)
     tags = ''
-    if 'x-vk-go-extra-tags' in ref_schema:
-        tags += ' ' + ref_schema['x-vk-go-extra-tags']
+    ref_extra_tags = prop_get(ref_schema, 'go-extra-tags')
+    if ref_extra_tags is not None:
+        tags += ' ' + ref_extra_tags
 
-    def_name = _camel_case(def_path[-1])
-    if 'x-vk-go-def-name' in ref_schema:
-        def_name = ref_schema['x-vk-go-def-name']
+    def_name = prop_get(ref_schema, 'go-def-name', _camel_case(def_path[-1]))
     go_rel_def_name = ''
     # TODO: compare output file paths
     if openapi_fp.resolve().parent == ref_fp.resolve().parent:
@@ -465,8 +498,9 @@ class GoDef(str):
 def generate_golang_definition(openapi_fp: Path, openapi_schema: dict) -> GoDef:
     s = openapi_schema
 
-    if 'x-vk-go-def' in s:
-        return s['x-vk-go-def'].rstrip('\n')
+    go_def_override = prop_get(s, 'go-def')
+    if go_def_override is not None:
+        return go_def_override.rstrip('\n')
 
     if '$ref' in s:
         ref_def, extra_tags = generate_golang_definition_ref(openapi_fp, s['$ref'])
@@ -527,20 +561,18 @@ def handle_definitions_file(openapi_fp: Path, output_fp: Path, output_lang: Prog
         # data generation (enum values)
         if 'enum' in schema:
             enum_type = golang_def_name
-            enum_type_abbrev = _abbr(enum_type)
-            if 'x-vk-go-type-name-abbrev' in schema:
-                enum_type_abbrev = schema['x-vk-go-type-name-abbrev']
+            enum_type_abbrev = prop_get(schema, 'go-type-name-abbrev', _abbr(enum_type))
 
-            # Parse x-vk-enum-data-gen flag (defaults to ['values'])
-            enum_data_gen_options = schema.get('x-vk-enum-data-gen', ['values'])
+            enum_data_gen_options = prop_get(schema, 'enum-data-gen', ['values'])
+            enum_data_gen_name = prop_canonical('enum-data-gen')
             if not isinstance(enum_data_gen_options, list):
-                raise RuntimeError(f'x-vk-enum-data-gen must be a list, got: {type(enum_data_gen_options)}')
+                raise RuntimeError(f'{enum_data_gen_name} must be a list, got: {type(enum_data_gen_options)}')
 
             # Validate options
             valid_options = {'values', 'aggregated_values'}
             for opt in enum_data_gen_options:
                 if opt not in valid_options:
-                    raise RuntimeError(f'Invalid x-vk-enum-data-gen option: {opt}. Valid options: {valid_options}')
+                    raise RuntimeError(f'Invalid {enum_data_gen_name} option: {opt}. Valid options: {valid_options}')
 
             # Generate individual enum values
             if 'values' in enum_data_gen_options:
@@ -586,7 +618,7 @@ def prettify_uri_part(parts: list[str], i: int) -> str:
     return part
 
 def _apply_optional_policy(cur_def, schema):
-    optional_policy = schema.get('x-vk-go-null-or-undefined-is', 'any_nil')
+    optional_policy = prop_get(schema, 'go-null-or-undefined-is', 'any_nil')
     if optional_policy == 'any_nil':
         if not (cur_def.startswith('[]') or cur_def.startswith('map[')):
             cur_def = '*' + cur_def
@@ -635,11 +667,10 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
                         if not is_required and not (p_def.startswith('[]') or p_def.startswith('map[')):
                             p_def = _apply_optional_policy(p_def, p)
                         tags = f'uri:"{name}"'
-                        if 'x-vk-go-extra-tags' in p['schema']:
-                            tags += ' ' + p['schema']['x-vk-go-extra-tags']
-                        field_name = _camel_case(name)
-                        if 'x-vk-go-field-name' in p:
-                            field_name = p['x-vk-go-field-name']
+                        uri_extra_tags = prop_get(p['schema'], 'go-extra-tags')
+                        if uri_extra_tags is not None:
+                            tags += ' ' + uri_extra_tags
+                        field_name = prop_get(p, 'go-field-name', _camel_case(name))
                         p_def = f'{field_name} {p_def} `{tags}`'
                         uri_fields.append(p_def)
 
@@ -654,11 +685,10 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
                         if not is_required:
                             p_def = _apply_optional_policy(p_def, p)
                         tags = f'query:"{name}" form:"{name}"'
-                        if 'x-vk-go-extra-tags' in p['schema']:
-                            tags += ' ' + p['schema']['x-vk-go-extra-tags']
-                        field_name = _camel_case(name)
-                        if 'x-vk-go-field-name' in p:
-                            field_name = p['x-vk-go-field-name']
+                        query_extra_tags = prop_get(p['schema'], 'go-extra-tags')
+                        if query_extra_tags is not None:
+                            tags += ' ' + query_extra_tags
+                        field_name = prop_get(p, 'go-field-name', _camel_case(name))
                         p_def = f'{field_name} {p_def} `{tags}`'
                         query_fields.append(p_def)
                     case 'header':
