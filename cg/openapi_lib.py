@@ -88,7 +88,7 @@ CODEGEN_FILE_NAME_PREFIX = ''
 # TODO: migrate in a separate commit
 CODEGEN_FILE_NAME_SUFFIX = '.cg'
 
-FW_IMPORT_PATH = os.environ.get('FW_IMPORT_PATH', 'github.com/Deimvis-go/fw')
+FW_IMPORT_PATH = os.environ.get('FW_IMPORT_PATH', 'github.com/Deimvis-go/fw/fw')
 
 # Prefixes for custom openapi extension properties (e.g. `x-cg-go-def`,
 # `x-cg-header`). The first prefix is the canonical one used in error messages;
