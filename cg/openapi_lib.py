@@ -619,8 +619,11 @@ def _ref_go_package_name(openapi_fp: Path, ref_fp: Path) -> str | None:
     For ordinary volumes, the package is the parent dir name of the output
     file. For `dst="-"` (no output), the package comes from
     `imports.golang` — not yet implemented, so this errors out."""
-    if openapi_fp.resolve().parent == ref_fp.resolve().parent:
-        return None
+    # The same-parent shortcut only applies when both files are local. Remote
+    # caches all share a flat tempdir so their `parent` would collide.
+    if not remote.is_cache_path(openapi_fp) and not remote.is_cache_path(ref_fp):
+        if openapi_fp.resolve().parent == ref_fp.resolve().parent:
+            return None
     rel_source, vol = resolve_volume(ref_fp)
     if vol.dst is None:
         imports_lang = vol.imports.get('golang') if isinstance(vol.imports, dict) else None

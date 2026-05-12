@@ -26,21 +26,19 @@ def is_url(s: str) -> bool:
     return s.startswith("http://") or s.startswith("https://")
 
 
-def normalize_url(url: str) -> str:
-    """Rewrite a github.com/<owner>/<repo>/<rest> URL to the raw form.
+def _looks_like_gitlab(parsed: urllib.parse.ParseResult) -> bool:
+    """Heuristic for self-hosted and gitlab.com URLs."""
+    if parsed.netloc == "gitlab.com" or parsed.netloc.startswith("gitlab."):
+        return True
+    # Any URL using the `/-/blob/` or `/-/raw/` convention is a GitLab URL,
+    # even on hosts that don't advertise themselves as gitlab.
+    return "/-/blob/" in parsed.path or "/-/raw/" in parsed.path
 
-    Plain github.com URLs without `/blob/<ref>/` are interpreted as pointing
-    at the default branch (`main`). URLs that already point at raw content,
-    or that include `/blob/<ref>/`, are passed through.
-    """
-    if not is_url(url):
-        return url
-    parsed = urllib.parse.urlparse(url)
-    if parsed.netloc != "github.com":
-        return url
+
+def _normalize_github(parsed: urllib.parse.ParseResult) -> str:
     parts = [p for p in parsed.path.split("/") if p]
     if len(parts) < 3:
-        return url
+        return urllib.parse.urlunparse(parsed)
     owner, repo, *rest = parts
     if rest and rest[0] in ("blob", "raw"):
         # github.com/owner/repo/blob/<ref>/<path> -> raw.githubusercontent.com/owner/repo/<ref>/<path>
@@ -50,6 +48,55 @@ def normalize_url(url: str) -> str:
     # Convenience form: assume default branch `main`.
     new_path = "/".join([owner, repo, "main", *rest])
     return urllib.parse.urlunparse(parsed._replace(netloc="raw.githubusercontent.com", path="/" + new_path))
+
+
+def _normalize_gitlab(parsed: urllib.parse.ParseResult) -> str:
+    """Normalize gitlab.com (and self-hosted gitlab) URLs to their raw form.
+
+    Accepts:
+      - .../<namespace>/<repo>/-/blob/<ref>/<path> -> .../<namespace>/<repo>/-/raw/<ref>/<path>
+      - .../<namespace>/<repo>/-/raw/<ref>/<path>  (passthrough)
+      - .../<owner>/<repo>/<path>                   -> .../<owner>/<repo>/-/raw/main/<path>
+
+    For repos in nested groups (`group/sub/repo`), the convenience form is
+    ambiguous; use the explicit `/-/blob/<ref>/...` or `/-/raw/<ref>/...`
+    form so cg can find the project/path boundary.
+    """
+    parts = [p for p in parsed.path.split("/") if p]
+    # Find the `-` separator that splits namespace+repo from blob/raw+ref+path.
+    if "-" in parts:
+        idx = parts.index("-")
+        if idx >= 2 and idx + 2 < len(parts) and parts[idx + 1] in ("blob", "raw"):
+            namespace = parts[:idx]
+            kind, ref, *rest = parts[idx + 1:]
+            new_parts = namespace + ["-", "raw", ref, *rest]
+            return urllib.parse.urlunparse(parsed._replace(path="/" + "/".join(new_parts)))
+        return urllib.parse.urlunparse(parsed)
+    # Convenience form with no `/-/blob/` marker: assume `main`.
+    if len(parts) < 2:
+        return urllib.parse.urlunparse(parsed)
+    namespace_repo = parts[:2]
+    rest = parts[2:]
+    new_parts = namespace_repo + ["-", "raw", "main", *rest]
+    return urllib.parse.urlunparse(parsed._replace(path="/" + "/".join(new_parts)))
+
+
+def normalize_url(url: str) -> str:
+    """Rewrite a known forge URL to its raw-content form.
+
+    - GitHub: github.com/<owner>/<repo>/[blob/<ref>/]<path> -> raw.githubusercontent.com/<owner>/<repo>/<ref-or-main>/<path>
+    - GitLab: <host>/<owner>/<repo>/-/blob/<ref>/<path>     -> <host>/<owner>/<repo>/-/raw/<ref>/<path>
+              <host>/<owner>/<repo>/<path>                   -> <host>/<owner>/<repo>/-/raw/main/<path>
+    Other URLs pass through unchanged.
+    """
+    if not is_url(url):
+        return url
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc == "github.com":
+        return _normalize_github(parsed)
+    if _looks_like_gitlab(parsed):
+        return _normalize_gitlab(parsed)
+    return url
 
 
 def _cache_dir() -> Path:
