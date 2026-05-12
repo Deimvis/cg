@@ -16,7 +16,7 @@ builder {
   src = ./.;
 
   build-system = [ python3.pkgs.setuptools ];
-  dependencies = [ python3.pkgs.pyyaml ];
+  dependencies = [ python3.pkgs.pyyaml python3.pkgs.jinja2 ];
 
   doCheck = false;
 

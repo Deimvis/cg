@@ -9,6 +9,7 @@ description = "Codegen CLI for openapi schemas and sql query validation tests"
 requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0",
+    "Jinja2>=3.0",
 ]
 
 [project.scripts]

@@ -14,7 +14,10 @@ DST_GO_TESTS = "go/tests"
 def _parse_volumes(raw: list[str] | None) -> list[openapi_lib.Volume]:
     if not raw:
         return []
-    return [openapi_lib.Volume(**remote.parse_volume(v)) for v in raw]
+    return [
+        openapi_lib.Volume(**remote.parse_volume(v, render_dst=openapi_lib.render_dst))
+        for v in raw
+    ]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -153,6 +156,7 @@ def _run_sql(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
+    openapi_lib.OUTPUT_TYPE = args.dst_type
     if args.src_type == SRC_OPENAPI:
         _run_openapi(args)
     elif args.src_type == SRC_SQL:

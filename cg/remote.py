@@ -107,7 +107,9 @@ def _coerce_src(raw: str) -> str | Path:
     return _coerce_local_path(raw)
 
 
-def _coerce_dst(raw: str) -> Path | None:
+def _coerce_dst(raw: str, render=None) -> Path | None:
+    if render is not None:
+        raw = render(raw)
     if raw == "-":
         return None
     return _coerce_local_path(raw)
@@ -151,13 +153,16 @@ def _parse_long_form(raw: str) -> dict:
     return out
 
 
-def parse_volume(raw: str) -> dict:
+def parse_volume(raw: str, render_dst=None) -> dict:
     """Parse a volume spec into a dict with keys `src`, `dst`, `read_only`,
     `checks`.
 
     Short form: `src:dst`, optionally suffixed with `:ro` and/or `:ro+nocheck`.
     Long form (triggered when raw contains `,`):
       `src="...",dst="...",read_only=true,checks=null`
+
+    If `render_dst` is provided, it's invoked on the raw dst string before
+    Path coercion (used to expand jinja templates like `{{output_type}}`).
     """
     if "," in raw:
         spec = _parse_long_form(raw)
@@ -175,7 +180,7 @@ def parse_volume(raw: str) -> dict:
             raise SystemExit("volume spec: only checks=null is supported for now")
         return {
             "src": _coerce_src(str(spec["src"])),
-            "dst": _coerce_dst(str(spec["dst"])),
+            "dst": _coerce_dst(str(spec["dst"]), render_dst),
             "read_only": read_only,
             "checks": None,
         }
@@ -211,7 +216,7 @@ def parse_volume(raw: str) -> dict:
 
     return {
         "src": src,
-        "dst": _coerce_dst(dst_raw),
+        "dst": _coerce_dst(dst_raw, render_dst),
         "read_only": read_only,
         "checks": None,
     }

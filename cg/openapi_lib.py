@@ -99,6 +99,28 @@ PROP_PREFIXES: list[str] = [
 ] or ['x-cg']
 
 
+# Set by the CLI before any codegen runs; consumed by jinja templates inside
+# volume `dst` strings (variable `output_type`).
+OUTPUT_TYPE: str | None = None
+
+
+def render_dst(raw: str) -> str:
+    """Render a volume `dst` string as a jinja2 template. The only variable
+    exposed is `output_type` (the --dst-type CLI value). Unknown variables
+    or syntax errors raise SystemExit with the offending template."""
+    if '{{' not in raw and '{%' not in raw:
+        return raw
+    import jinja2
+    env = jinja2.Environment(undefined=jinja2.StrictUndefined, autoescape=False)
+    try:
+        tmpl = env.from_string(raw)
+        return tmpl.render(output_type=OUTPUT_TYPE)
+    except jinja2.exceptions.UndefinedError as e:
+        raise SystemExit(f'volume dst template {raw!r}: {e}')
+    except jinja2.exceptions.TemplateSyntaxError as e:
+        raise SystemExit(f'volume dst template {raw!r}: syntax error: {e}')
+
+
 _MISSING = object()
 
 
@@ -267,6 +289,7 @@ def _file_default_volume(openapi_fp: Path) -> Volume | None:
     dst_raw = spec['dst']
     if not isinstance(dst_raw, str):
         raise SystemExit(f'{openapi_fp}: default_volume.dst must be a string (got {type(dst_raw).__name__})')
+    dst_raw = render_dst(dst_raw)
 
     read_only = spec.get('read_only', False)
     if not isinstance(read_only, bool):
