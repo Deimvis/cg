@@ -44,15 +44,42 @@ from . import remote
 MODELS = Path.cwd() / 'src/models'
 MODELS_TMP = Path.cwd() / 'tmp/models'
 
-VOLUMES: list[tuple[Path | str, Path]] = [
-    # custom; each entry is (src, dst) where `src` is a local Path or a URL string
-    # prefix (http(s)://...), and `dst` is the local output directory Path.
-   ((Path.cwd() / 'docs/openapi/definitions'), MODELS),
-]
+from dataclasses import dataclass, field
 
-DEFAULT_VOLUME: dict[Path, Path] = {
-    (Path.cwd() / 'docs/openapi'): MODELS / 'api',
-}
+
+@dataclass
+class Volume:
+    """A volume maps a source location (local dir or URL prefix) to a local
+    output directory, plus options that control how files matched by this
+    volume are treated.
+
+    Attributes:
+        src: local Path prefix or URL string prefix. For per-file fallback
+             volumes derived from `x-cg-header.default_volume`, this is the
+             file's own absolute Path (or its source URL).
+        dst: local output directory Path, or the sentinel `None` meaning
+             "no output" (the `-` form in user input; see `dst_is_none`).
+        read_only: if True, files matched by this volume are NOT regenerated;
+             their existing generated output (or explicit import rules) is
+             used to resolve cross-file `$ref`s.
+        checks: validation policy for read-only outputs. Only meaningful when
+             `read_only` is True; must be `None` until checks are implemented.
+        imports: per-language import rules. Only `None` accepted for each
+             language until rules are defined.
+    """
+    src: Path | str
+    dst: Path | None
+    read_only: bool = False
+    checks: object = None
+    imports: dict = field(default_factory=dict)
+
+    @property
+    def dst_is_none(self) -> bool:
+        return self.dst is None
+
+
+VOLUMES: list[Volume] = []
+DEFAULT_VOLUME: list[Volume] = []
 
 
 CODEGEN_FILE_HEADER = '// THIS CODE IS GENERATED - DO NOT CHANGE IT'
@@ -146,91 +173,177 @@ def _url_relative(url: str, prefix: str) -> str:
     return url_path[len(prefix_path) + 1:]
 
 
-def _match_volume(openapi_fp: Path) -> tuple[Path, Path] | None:
-    """Pick the closest matching volume for `openapi_fp` and return
-    (relative_source, output_dir) where `relative_source` is the file
-    path relative to the volume's source root. Returns None if nothing matches."""
+def _match_volume_against(openapi_fp: Path, volumes: list[Volume]) -> tuple[str, Volume] | None:
+    """Pick the closest matching volume in `volumes` for `openapi_fp` and
+    return `(relative_source_str, volume)`. Returns None if nothing matches."""
     source_url = remote.url_of_cache_path(openapi_fp)
-
-    matches: list[tuple[int, Path, str]] = []  # (distance, output_dir, relative_source_str)
+    matches: list[tuple[int, str, Volume]] = []
 
     if source_url is not None:
         url_parents = _url_parents(source_url)
-        for src, output_dir in VOLUMES:
-            if not isinstance(src, str):
+        for vol in volumes:
+            if not isinstance(vol.src, str):
                 continue
             for i, parent in enumerate(url_parents):
-                if parent.rstrip('/') == src.rstrip('/'):
-                    rel = _url_relative(source_url, src)
-                    matches.append((i, output_dir, rel))
+                if parent.rstrip('/') == vol.src.rstrip('/'):
+                    rel = _url_relative(source_url, vol.src)
+                    matches.append((i, rel, vol))
                     break
+            else:
+                # also accept exact URL match (per-file default_volume where src == file URL)
+                if vol.src.rstrip('/') == source_url.rstrip('/'):
+                    matches.append((0, '', vol))
     else:
-        for src, output_dir in VOLUMES:
-            if not isinstance(src, Path):
+        for vol in volumes:
+            if not isinstance(vol.src, Path):
+                continue
+            if vol.src == openapi_fp:
+                matches.append((0, '', vol))
                 continue
             for i in range(len(openapi_fp.parents)):
-                if openapi_fp.parents[i] == src:
-                    rel = str(openapi_fp.relative_to(src))
-                    matches.append((i, output_dir, rel))
+                if openapi_fp.parents[i] == vol.src:
+                    rel = str(openapi_fp.relative_to(vol.src))
+                    matches.append((i, rel, vol))
                     break
-        if not matches:
-            for src, output_dir in DEFAULT_VOLUME.items():
-                for i in range(len(openapi_fp.parents)):
-                    if openapi_fp.parents[i] == src:
-                        rel = str(openapi_fp.relative_to(src))
-                        matches.append((i, output_dir, rel))
-                        break
 
     if not matches:
         return None
     matches.sort(key=lambda m: m[0])
-    _, output_dir, rel = matches[0]
-    return Path(rel), output_dir
+    _, rel, vol = matches[0]
+    return rel, vol
 
 
-def get_out_fp(openapi_fp: Path) -> Path:
-    # TODO: recursively regenerate each dependency (openapi fp)
-    #       Use explicit destinations specifiedd inside openapi fp when exists (must specify main that will be included by others or default resolve policy: import closest from file who requested this definition)
-    #       if they aren't present -> try to resolve using volumes mappings
-    #       if no output_fp found -> error.
-    #       Common rule:
-    #       - libraries (any common dependencies for multiple openapi_fps) use explicit destinations,
-    #       - end-specs (like reset api) use volumes
+def _match_volume(openapi_fp: Path) -> tuple[str, Volume] | None:
+    """Match `openapi_fp` against configured CLI volumes first, then the
+    file's own per-file fallback `default_volume`, then the module-level
+    DEFAULT_VOLUME fallback."""
+    m = _match_volume_against(openapi_fp, VOLUMES)
+    if m is not None:
+        return m
+    file_fallback = _file_default_volume(openapi_fp)
+    if file_fallback is not None:
+        m = _match_volume_against(openapi_fp, [file_fallback])
+        if m is not None:
+            return m
+    return _match_volume_against(openapi_fp, DEFAULT_VOLUME)
 
-    # check explicit destinations
 
+_DEFAULT_VOLUME_ALLOWED_KEYS = {'dst', 'read_only', 'checks', 'imports'}
+_DEFAULT_VOLUME_CACHE: dict[Path, Volume | None] = {}
+
+
+def _file_default_volume(openapi_fp: Path) -> Volume | None:
+    """Parse and validate `x-cg-header.default_volume` from `openapi_fp`.
+    Returns a Volume whose `src` is the file's own location (Path or URL),
+    or None if the file has no `default_volume`."""
+    if openapi_fp in _DEFAULT_VOLUME_CACHE:
+        return _DEFAULT_VOLUME_CACHE[openapi_fp]
+
+    with openapi_fp.open('r') as f:
+        content = yaml.safe_load(f) or {}
+    header = prop_get(content, 'header')
+    if not isinstance(header, dict) or 'default_volume' not in header:
+        _DEFAULT_VOLUME_CACHE[openapi_fp] = None
+        return None
+
+    spec = header['default_volume']
+    if not isinstance(spec, dict):
+        raise SystemExit(f'{openapi_fp}: default_volume must be a mapping')
+    unknown = set(spec.keys()) - _DEFAULT_VOLUME_ALLOWED_KEYS
+    if unknown:
+        raise SystemExit(f'{openapi_fp}: default_volume has unknown keys: {sorted(unknown)}')
+
+    if 'dst' not in spec:
+        raise SystemExit(f'{openapi_fp}: default_volume.dst is required')
+    dst_raw = spec['dst']
+    if not isinstance(dst_raw, str):
+        raise SystemExit(f'{openapi_fp}: default_volume.dst must be a string (got {type(dst_raw).__name__})')
+
+    read_only = spec.get('read_only', False)
+    if not isinstance(read_only, bool):
+        raise SystemExit(f'{openapi_fp}: default_volume.read_only must be a boolean')
+
+    checks = spec.get('checks', None)
+    if checks is not None:
+        raise SystemExit(f'{openapi_fp}: default_volume.checks is reserved; only null is supported')
+    if 'checks' in spec and not read_only:
+        raise SystemExit(f'{openapi_fp}: default_volume.checks is only valid when read_only=true')
+
+    imports_raw = spec.get('imports', {})
+    if not isinstance(imports_raw, dict):
+        raise SystemExit(f'{openapi_fp}: default_volume.imports must be a mapping')
+    for lang, lang_rules in imports_raw.items():
+        if lang_rules is not None:
+            raise SystemExit(
+                f'{openapi_fp}: default_volume.imports.{lang} is reserved; only null is supported'
+            )
+
+    dst: Path | None
+    if dst_raw == '-':
+        dst = None
+    else:
+        dst_path = Path(os.path.expanduser(dst_raw))
+        if dst_path.is_absolute():
+            dst = dst_path
+        else:
+            # Relative to the directory of the openapi file. For URL-sourced
+            # files we still resolve against the local cache parent; output
+            # dirs for remote read-only libs typically use absolute paths.
+            dst = (openapi_fp.parent / dst_path).resolve()
+
+    src: Path | str
+    source_url = remote.url_of_cache_path(openapi_fp)
+    src = source_url if source_url is not None else openapi_fp
+
+    vol = Volume(src=src, dst=dst, read_only=read_only, checks=checks, imports=imports_raw)
+    _DEFAULT_VOLUME_CACHE[openapi_fp] = vol
+    return vol
+
+
+def _resolved_output_dir(rel_source: str, vol: Volume) -> Path | None:
+    """Compute the output *directory* for a file matched by `vol`. For
+    per-file default_volume matches `rel_source` is empty and `vol.dst`
+    already names the output dir (or its containing dir). Returns None when
+    the volume has `dst="-"` (no output)."""
+    if vol.dst is None:
+        return None
+    if rel_source == '':
+        return vol.dst
+    return vol.dst / Path(rel_source).parent
+
+
+def resolve_volume(openapi_fp: Path) -> tuple[str, Volume]:
+    """Match `openapi_fp` to a Volume, or raise SystemExit with a clear message."""
+    match = _match_volume(openapi_fp)
+    if match is not None:
+        return match
+    source_repr = remote.url_of_cache_path(openapi_fp) or str(openapi_fp)
+    raise SystemExit(
+        f'no volume matches source file {source_repr!r}; '
+        f'pass --volume <src>:<dst> (src may be a local directory or a URL prefix), '
+        f'or set x-cg-header.default_volume inside the file'
+    )
+
+
+def get_out_fp(openapi_fp: Path) -> Path | None:
+    """Return the output file path for `openapi_fp`, or None if the matching
+    volume has `dst="-"` (no output, import rules used for ref resolution)."""
     assert openapi_fp.exists(), f'openapi file doesnt exist: {openapi_fp}'
     assert openapi_fp.is_file()
     assert openapi_fp.suffix == '.yaml'
+
     with openapi_fp.open('r') as f:
-        content = yaml.safe_load(f)
-    header = prop_get(content, 'header')
-    if header is not None:
-        if 'explicit_codegen_destinations' in header:
-            ecds = header['explicit_codegen_destinations']
-            # TODO: support other lang
-            if 'golang' in ecds and len(ecds['golang']) > 0:
-                # TODO: support multiple destinations
-                dest = ecds['golang'][0]
-                # TODO: support abs path
-                rel_dest_fp = ecds['golang'][0]['relative_path']
-                out_fp = (openapi_fp.parent / Path(rel_dest_fp)).resolve()
-                assert out_fp.parent.exists()
-                return out_fp
+        content = yaml.safe_load(f) or {}
+    components = content.get('components') or {}
+    if 'schemas' not in components:
+        return None
 
-    if 'schemas' not in content['components']:
-        return
-
-    match = _match_volume(openapi_fp)
-    if match is None:
-        source_repr = remote.url_of_cache_path(openapi_fp) or str(openapi_fp)
-        raise SystemExit(
-            f'no volume matches source file {source_repr!r}; '
-            f'pass --volume <src>:<dst> (src may be a local directory or a URL prefix) '
-            f'to specify where its output should be written'
-        )
-    rel_source, output_dir = match
-    return with_extension(output_dir / rel_source, '.go')
+    rel_source, vol = resolve_volume(openapi_fp)
+    out_dir = _resolved_output_dir(rel_source, vol)
+    if out_dir is None:
+        return None
+    basename = Path(rel_source).name if rel_source else openapi_fp.name
+    return with_extension(out_dir / basename, '.go')
 
 
 
@@ -469,12 +582,39 @@ def _parse_ref(ref_value: str) -> tuple[str, list[str]]:
     return target, def_path
 
 
+def _ref_go_package_name(openapi_fp: Path, ref_fp: Path) -> str | None:
+    """Return the Go package name to use when `openapi_fp` references a
+    definition in `ref_fp`, or None when they live in the same package.
+
+    For ordinary volumes, the package is the parent dir name of the output
+    file. For `dst="-"` (no output), the package comes from
+    `imports.golang` — not yet implemented, so this errors out."""
+    if openapi_fp.resolve().parent == ref_fp.resolve().parent:
+        return None
+    rel_source, vol = resolve_volume(ref_fp)
+    if vol.dst is None:
+        imports_lang = vol.imports.get('golang') if isinstance(vol.imports, dict) else None
+        if imports_lang is None:
+            raise SystemExit(
+                f'$ref to {ref_fp} requires explicit import rules: '
+                f'default_volume.dst="-" but imports.golang is not configured'
+            )
+        # Reserved for when import rules are implemented.
+        raise SystemExit(
+            f'$ref to {ref_fp}: default_volume.imports.golang rules are not yet supported'
+        )
+    out_dir = _resolved_output_dir(rel_source, vol)
+    return out_dir.name
+
+
 def generate_golang_definition_ref(openapi_fp: Path, ref_value: str) -> tuple[str, str]:
     ref_target, def_path = _parse_ref(ref_value)
     ref_fp = _resolve_ref_target(openapi_fp, ref_target)
     if ref_fp not in PROCESSED_FILES:
         PROCESSED_FILES.append(ref_fp)
-        handle_definitions_file(ref_fp, get_out_fp(ref_fp), ProgrammingLanguage.Golang)
+        _, ref_vol = resolve_volume(ref_fp)
+        if not ref_vol.read_only:
+            handle_definitions_file(ref_fp, get_out_fp(ref_fp), ProgrammingLanguage.Golang)
 
     ref_schema = get_def_schema(ref_fp, def_path)
     tags = ''
@@ -483,13 +623,10 @@ def generate_golang_definition_ref(openapi_fp: Path, ref_value: str) -> tuple[st
         tags += ' ' + ref_extra_tags
 
     def_name = prop_get(ref_schema, 'go-def-name', _camel_case(def_path[-1]))
-    go_rel_def_name = ''
-    # TODO: compare output file paths
-    if openapi_fp.resolve().parent == ref_fp.resolve().parent:
-        go_rel_def_name = def_name
-    else:
-        go_rel_def_name = f'{get_out_fp(ref_fp).parent.name}.{def_name}'
-    return go_rel_def_name, tags
+    pkg = _ref_go_package_name(openapi_fp, ref_fp)
+    if pkg is None:
+        return def_name, tags
+    return f'{pkg}.{def_name}', tags
 
 
 class GoDef(str):
@@ -532,10 +669,13 @@ def generate_golang_definition(openapi_fp: Path, openapi_schema: dict) -> GoDef:
 def generate_definition(openapi_fp: Path, openapi_schema: dict, output_lang: ProgrammingLanguage) -> str:
     return generate_golang_definition(openapi_fp, openapi_schema)
 
-def handle_definitions_file(openapi_fp: Path, output_fp: Path, output_lang: ProgrammingLanguage):
+def handle_definitions_file(openapi_fp: Path, output_fp: Path | None, output_lang: ProgrammingLanguage):
     assert openapi_fp.exists()
     assert openapi_fp.is_file()
     assert openapi_fp.suffix == '.yaml'
+    if output_fp is None:
+        # Either dst="-" (no output) or no schemas — nothing to write.
+        return
     with openapi_fp.open('r') as f:
         content = yaml.safe_load(f)
     if 'components' not in content:

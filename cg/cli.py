@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from . import openapi_go, remote, sql_tests_go
+from . import openapi_go, openapi_lib, remote, sql_tests_go
 
 
 SRC_OPENAPI = "openapi"
@@ -11,10 +11,10 @@ DST_GO = "go"
 DST_GO_TESTS = "go/tests"
 
 
-def _parse_volumes(raw: list[str] | None) -> list[tuple[Path | str, Path]]:
+def _parse_volumes(raw: list[str] | None) -> list[openapi_lib.Volume]:
     if not raw:
         return []
-    return [remote.parse_volume(v) for v in raw]
+    return [openapi_lib.Volume(**remote.parse_volume(v)) for v in raw]
 
 
 def _build_parser() -> argparse.ArgumentParser:

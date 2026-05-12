@@ -93,25 +93,125 @@ def is_cache_path(path: Path) -> bool:
     return path in _URL_BY_CACHE_PATH
 
 
-def parse_volume(raw: str) -> tuple[str | Path, Path]:
-    """Parse a `src:dst` volume spec, accepting URL or local sources.
+_VOLUME_ALLOWED_KEYS = {"src", "dst", "read_only", "checks"}
 
-    Returns `(src, dst)` where `src` is a URL string (if it starts with
-    http:// or https://) or an absolute Path (resolved relative to cwd);
-    `dst` is always a local Path resolved relative to cwd.
-    """
+
+def _coerce_local_path(raw: str) -> Path:
+    p = Path(os.path.expanduser(raw))
+    return p if p.is_absolute() else Path.cwd() / p
+
+
+def _coerce_src(raw: str) -> str | Path:
     if is_url(raw):
-        # Find the `:` separating LHS URL from RHS local path. The URL
-        # itself contains `://`, so skip past it and find the next `:`.
+        return normalize_url(raw)
+    return _coerce_local_path(raw)
+
+
+def _coerce_dst(raw: str) -> Path | None:
+    if raw == "-":
+        return None
+    return _coerce_local_path(raw)
+
+
+def _parse_long_form(raw: str) -> dict:
+    """Parse `src="...",dst="...",read_only=true,checks=null` into a dict."""
+    out: dict = {}
+    # Split on commas at top level, respecting double-quoted segments.
+    parts: list[str] = []
+    buf, in_quote = "", False
+    for ch in raw:
+        if ch == '"':
+            in_quote = not in_quote
+            buf += ch
+        elif ch == "," and not in_quote:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if buf:
+        parts.append(buf)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(f"volume spec entry missing '=': {part!r}")
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            value = value[1:-1]
+        elif value == "true":
+            value = True
+        elif value == "false":
+            value = False
+        elif value == "null":
+            value = None
+        out[key] = value
+    return out
+
+
+def parse_volume(raw: str) -> dict:
+    """Parse a volume spec into a dict with keys `src`, `dst`, `read_only`,
+    `checks`.
+
+    Short form: `src:dst`, optionally suffixed with `:ro` and/or `:ro+nocheck`.
+    Long form (triggered when raw contains `,`):
+      `src="...",dst="...",read_only=true,checks=null`
+    """
+    if "," in raw:
+        spec = _parse_long_form(raw)
+        unknown = set(spec.keys()) - _VOLUME_ALLOWED_KEYS
+        if unknown:
+            raise SystemExit(f"volume spec has unknown keys: {sorted(unknown)}")
+        if "src" not in spec or "dst" not in spec:
+            raise SystemExit(f"volume spec must contain src and dst: {raw!r}")
+        read_only = spec.get("read_only", False)
+        if not isinstance(read_only, bool):
+            raise SystemExit(f"volume spec read_only must be true/false, got {read_only!r}")
+        if "checks" in spec and not read_only:
+            raise SystemExit("volume spec: checks is only valid when read_only=true")
+        if spec.get("checks", None) is not None:
+            raise SystemExit("volume spec: only checks=null is supported for now")
+        return {
+            "src": _coerce_src(str(spec["src"])),
+            "dst": _coerce_dst(str(spec["dst"])),
+            "read_only": read_only,
+            "checks": None,
+        }
+
+    # Short form. Strip well-known trailing options.
+    read_only = False
+    nocheck = False
+    while True:
+        if raw.endswith(":ro+nocheck"):
+            read_only, nocheck = True, True
+            raw = raw[: -len(":ro+nocheck")]
+        elif raw.endswith(":ro"):
+            read_only = True
+            raw = raw[: -len(":ro")]
+        else:
+            break
+
+    if "+nocheck" in raw and not read_only:
+        raise SystemExit("volume spec: ':ro+nocheck' requires :ro")
+
+    if is_url(raw):
         scheme_end = raw.find("://")
         sep = raw.find(":", scheme_end + 3)
         if sep == -1:
             raise SystemExit(f"volume spec missing local destination: {raw!r}")
-        src_url = normalize_url(raw[:sep])
+        src = normalize_url(raw[:sep])
         dst_raw = raw[sep + 1 :]
-        dst = Path(os.path.expanduser(dst_raw))
-        if not dst.is_absolute():
-            dst = Path.cwd() / dst
-        return src_url, dst
-    src_raw, dst_raw = raw.split(":", 1)
-    return Path.cwd() / src_raw, Path.cwd() / dst_raw
+    else:
+        if ":" not in raw:
+            raise SystemExit(f"volume spec must be 'src:dst[:ro[+nocheck]]': {raw!r}")
+        src_raw, dst_raw = raw.split(":", 1)
+        src = _coerce_local_path(src_raw)
+
+    return {
+        "src": src,
+        "dst": _coerce_dst(dst_raw),
+        "read_only": read_only,
+        "checks": None,
+    }

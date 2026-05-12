@@ -28,7 +28,7 @@ def _gofmt(*paths: Path) -> None:
 def run_api(
     input_file: Path,
     output_dir: Path,
-    volumes: list[tuple[Path | str, Path]] | None = None,
+    volumes: list[openapi_lib.Volume] | None = None,
     extra: list[Path | str] | None = None,
     output_basename_suffix: str | None = None,
 ) -> None:
@@ -60,7 +60,7 @@ def run_api(
 def run_definitions(input_file: Path, output_file: Path | None = None) -> None:
     assert input_file.is_file()
     if output_file is None:
-        openapi_lib.DEFAULT_VOLUME = {}
+        openapi_lib.DEFAULT_VOLUME = []
         output_file = get_out_fp(input_file)
     else:
         output_file.parent.mkdir(parents=True, exist_ok=True)
