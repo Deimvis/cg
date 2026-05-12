@@ -57,8 +57,14 @@ def run_api(
         _gofmt(d.absolute())
 
 
-def run_definitions(input_file: Path, output_file: Path | None = None) -> None:
+def run_definitions(
+    input_file: Path,
+    output_file: Path | None = None,
+    volumes: list[openapi_lib.Volume] | None = None,
+) -> None:
     assert input_file.is_file()
+    if volumes:
+        openapi_lib.VOLUMES = list(volumes) + openapi_lib.VOLUMES
     if output_file is None:
         openapi_lib.DEFAULT_VOLUME = []
         output_file = get_out_fp(input_file)
@@ -75,8 +81,8 @@ def run_definitions(input_file: Path, output_file: Path | None = None) -> None:
 def run_auto(
     input_file: Path,
     output: Path | None,
-    volumes: list[tuple[Path, Path]] | None = None,
-    extra: list[Path] | None = None,
+    volumes: list[openapi_lib.Volume] | None = None,
+    extra: list[Path | str] | None = None,
     output_basename_suffix: str | None = None,
 ) -> None:
     if _is_api_spec(input_file):
@@ -91,4 +97,4 @@ def run_auto(
         )
     else:
         out_file = output if (output is not None and not output.is_dir()) else None
-        run_definitions(input_file=input_file, output_file=out_file)
+        run_definitions(input_file=input_file, output_file=out_file, volumes=volumes)

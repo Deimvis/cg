@@ -24,7 +24,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "input",
         type=str,
-        help="Input file or directory (openapi also accepts http(s) URLs)",
+        help=(
+            "Input. openapi: file path, http(s) URL, or a glob suffix "
+            "('<prefix>/*' for one directory, '<prefix>/**' for recursive — "
+            "quote it so the shell does not expand it). sql: directory path"
+        ),
     )
     p.add_argument(
         "-o",
@@ -58,17 +62,44 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _expand_openapi_input(raw_input: str) -> list[Path]:
+    """Resolve the openapi input arg into a list of local yaml files.
+
+    Accepts: an http(s) URL (fetched), a single file path, or a glob
+    suffix '<prefix>/*' (one directory) / '<prefix>/**' (recursive).
+    """
+    if remote.is_url(raw_input):
+        return [remote.fetch(raw_input)]
+
+    if raw_input.endswith("/**"):
+        base = Path(raw_input[: -len("/**")])
+        if not base.is_dir():
+            raise SystemExit(f"input glob base must be a directory: {base}")
+        files = sorted(p for p in base.rglob("*.yaml") if p.is_file())
+        if not files:
+            raise SystemExit(f"input glob matched no .yaml files: {raw_input}")
+        return files
+
+    if raw_input.endswith("/*"):
+        base = Path(raw_input[: -len("/*")])
+        if not base.is_dir():
+            raise SystemExit(f"input glob base must be a directory: {base}")
+        files = sorted(p for p in base.glob("*.yaml") if p.is_file())
+        if not files:
+            raise SystemExit(f"input glob matched no .yaml files: {raw_input}")
+        return files
+
+    input_file = Path(raw_input)
+    if not input_file.is_file():
+        raise SystemExit(f"input must be a file: {input_file}")
+    return [input_file]
+
+
 def _run_openapi(args: argparse.Namespace) -> None:
     if args.dst_type != DST_GO:
         raise SystemExit(f"--dst-type {args.dst_type} is not supported for openapi (use {DST_GO})")
 
-    raw_input: str = args.input
-    if remote.is_url(raw_input):
-        input_file = remote.fetch(raw_input)
-    else:
-        input_file = Path(raw_input)
-        if not input_file.is_file():
-            raise SystemExit(f"input must be a file: {input_file}")
+    input_files = _expand_openapi_input(args.input)
 
     volumes = _parse_volumes(args.volume)
     extra: list[Path | str] = [
@@ -76,27 +107,35 @@ def _run_openapi(args: argparse.Namespace) -> None:
     ]
 
     output: Path | None = args.output
-    if output is not None and output.is_dir():
-        openapi_go.run_api(
+
+    if len(input_files) > 1 and output is not None and not output.is_dir():
+        raise SystemExit(
+            f"input glob matched {len(input_files)} files; "
+            f"-o must be a directory (or omitted) when input expands to multiple files"
+        )
+
+    for input_file in input_files:
+        if output is not None and output.is_dir():
+            openapi_go.run_api(
+                input_file=input_file,
+                output_dir=output,
+                volumes=volumes,
+                extra=extra,
+                output_basename_suffix=args.output_basename_suffix,
+            )
+            continue
+
+        if output is not None:
+            openapi_go.run_definitions(input_file=input_file, output_file=output)
+            continue
+
+        openapi_go.run_auto(
             input_file=input_file,
-            output_dir=output,
+            output=None,
             volumes=volumes,
             extra=extra,
             output_basename_suffix=args.output_basename_suffix,
         )
-        return
-
-    if output is not None:
-        openapi_go.run_definitions(input_file=input_file, output_file=output)
-        return
-
-    openapi_go.run_auto(
-        input_file=input_file,
-        output=None,
-        volumes=volumes,
-        extra=extra,
-        output_basename_suffix=args.output_basename_suffix,
-    )
 
 
 def _run_sql(args: argparse.Namespace) -> None:
