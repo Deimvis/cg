@@ -14,8 +14,7 @@ from .openapi_lib import (
 
 
 def _is_api_spec(input_file: Path) -> bool:
-    with input_file.open("r") as f:
-        content = yaml.safe_load(f) or {}
+    content = openapi_lib.load_yaml(input_file) or {}
     return isinstance(content, dict) and "paths" in content
 
 

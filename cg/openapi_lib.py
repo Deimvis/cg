@@ -5,7 +5,7 @@ import yaml
 from enum import Enum
 from pathlib import Path
 
-from . import remote
+from . import properties, remote
 
 # TODO: support redefining settings for whole file, or for models matching regex in this file
 # TODO: emergent
@@ -114,6 +114,16 @@ def prop_get(schema: dict, suffix: str, default=None):
 
 def prop_in(schema: dict, suffix: str) -> bool:
     return prop_get(schema, suffix, _MISSING) is not _MISSING
+
+
+def load_yaml(path: Path):
+    """Load YAML from `path` and rewrite flat-form cg extension properties
+    to canonical nested form."""
+    with path.open('r') as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return data
+    return properties.preprocess(data, PROP_PREFIXES)
 
 
 def prop_canonical(suffix: str) -> str:
@@ -239,8 +249,7 @@ def _file_default_volume(openapi_fp: Path) -> Volume | None:
     if openapi_fp in _DEFAULT_VOLUME_CACHE:
         return _DEFAULT_VOLUME_CACHE[openapi_fp]
 
-    with openapi_fp.open('r') as f:
-        content = yaml.safe_load(f) or {}
+    content = load_yaml(openapi_fp) or {}
     header = prop_get(content, 'header')
     if not isinstance(header, dict) or 'default_volume' not in header:
         _DEFAULT_VOLUME_CACHE[openapi_fp] = None
@@ -332,8 +341,7 @@ def get_out_fp(openapi_fp: Path) -> Path | None:
     assert openapi_fp.is_file()
     assert openapi_fp.suffix == '.yaml'
 
-    with openapi_fp.open('r') as f:
-        content = yaml.safe_load(f) or {}
+    content = load_yaml(openapi_fp) or {}
     components = content.get('components') or {}
     if 'schemas' not in components:
         return None
@@ -546,8 +554,7 @@ def generate_golang_definition_object(openapi_fp: Path, openapi_schema: dict) ->
 
 
 def get_def_schema(openapi_fp: Path, def_path: list[str]) -> dict:
-    with openapi_fp.open('r') as f:
-        data = yaml.safe_load(f)
+    data = load_yaml(openapi_fp)
     node = data
     for p in def_path:
         node = node[p]
@@ -676,8 +683,7 @@ def handle_definitions_file(openapi_fp: Path, output_fp: Path | None, output_lan
     if output_fp is None:
         # Either dst="-" (no output) or no schemas — nothing to write.
         return
-    with openapi_fp.open('r') as f:
-        content = yaml.safe_load(f)
+    content = load_yaml(openapi_fp)
     if 'components' not in content:
         return
     if 'schemas' not in content['components']:
@@ -778,8 +784,7 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
     assert openapi_api_fp.exists()
     assert openapi_api_fp.is_file()
     assert openapi_api_fp.suffix == '.yaml'
-    with openapi_api_fp.open('r') as f:
-        content = yaml.safe_load(f)
+    content = load_yaml(openapi_api_fp)
 
     for path in content['paths']:
         canonized_path_parts = []
