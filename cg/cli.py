@@ -1,7 +1,9 @@
 import argparse
 from pathlib import Path
 
-from . import openapi_go, openapi_lib, remote, sql_tests_go
+import sys
+
+from . import config, openapi_go, openapi_lib, remote, sql_tests_go
 
 
 SRC_OPENAPI = "openapi"
@@ -65,14 +67,22 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _expand_openapi_input(raw_input: str) -> list[Path]:
-    """Resolve the openapi input arg into a list of local yaml files.
+def _expand_openapi_input(raw_input: str) -> tuple[list[Path], Path | str]:
+    """Resolve the openapi input arg into a list of yaml files and the
+    natural volume `src` root for those files.
 
-    Accepts: an http(s) URL (fetched), a single file path, or a glob
-    suffix '<prefix>/*' (one directory) / '<prefix>/**' (recursive).
+    Returns `(files, root)` where `root` is:
+      - the URL parent prefix for URL inputs,
+      - the glob base directory for glob inputs,
+      - the file path itself for single-file inputs (exact-match volume).
+
+    `root` is used to inject an implicit volume mapping `root -> -o` so a
+    user doesn't have to pass a redundant `-v` alongside `-o`.
     """
     if remote.is_url(raw_input):
-        return [remote.fetch(raw_input)]
+        canonical = remote.normalize_url(raw_input)
+        fetched = remote.fetch(raw_input)
+        return [fetched], canonical
 
     if raw_input.endswith("/**"):
         base = Path(raw_input[: -len("/**")])
@@ -81,7 +91,7 @@ def _expand_openapi_input(raw_input: str) -> list[Path]:
         files = sorted(p for p in base.rglob("*.yaml") if p.is_file())
         if not files:
             raise SystemExit(f"input glob matched no .yaml files: {raw_input}")
-        return files
+        return files, base.absolute()
 
     if raw_input.endswith("/*"):
         base = Path(raw_input[: -len("/*")])
@@ -90,19 +100,19 @@ def _expand_openapi_input(raw_input: str) -> list[Path]:
         files = sorted(p for p in base.glob("*.yaml") if p.is_file())
         if not files:
             raise SystemExit(f"input glob matched no .yaml files: {raw_input}")
-        return files
+        return files, base.absolute()
 
     input_file = Path(raw_input)
     if not input_file.is_file():
         raise SystemExit(f"input must be a file: {input_file}")
-    return [input_file]
+    return [input_file], input_file.absolute()
 
 
 def _run_openapi(args: argparse.Namespace) -> None:
     if args.dst_type != DST_GO:
         raise SystemExit(f"--dst-type {args.dst_type} is not supported for openapi (use {DST_GO})")
 
-    input_files = _expand_openapi_input(args.input)
+    input_files, input_root = _expand_openapi_input(args.input)
 
     volumes = _parse_volumes(args.volume)
     extra: list[Path | str] = [
@@ -111,34 +121,73 @@ def _run_openapi(args: argparse.Namespace) -> None:
 
     output: Path | None = args.output
 
-    if len(input_files) > 1 and output is not None and not output.is_dir():
+    # `-o` resolves to either a single output file (definitions, suffixed path)
+    # or an output directory. When it's a directory, we also inject a volume
+    # mapping `input_root -> output` so files under the input scope get routed
+    # to `-o` without the user having to repeat themselves with `-v`.
+    output_is_file = (
+        output is not None
+        and (output.is_file() or (not output.exists() and output.suffix != ""))
+    )
+
+    if output is not None and not output_is_file:
+        output.mkdir(parents=True, exist_ok=True)
+        implicit = openapi_lib.Volume(src=input_root, dst=output.absolute())
+        volumes = [implicit] + volumes
+
+    if len(input_files) > 1 and output_is_file:
         raise SystemExit(
-            f"input glob matched {len(input_files)} files; "
-            f"-o must be a directory (or omitted) when input expands to multiple files"
+            f"input matched {len(input_files)} files; -o must be a directory "
+            f"(or omitted) when input expands to multiple files"
         )
 
     for input_file in input_files:
-        if output is not None and output.is_dir():
+        is_api = openapi_go._is_api_spec(input_file)
+
+        if is_api:
+            api_output_dir = output if (output is not None and not output_is_file) else None
+            if api_output_dir is None:
+                # No `-o` directory given; ask the volume system where this
+                # api file should be written.
+                if volumes:
+                    openapi_lib.VOLUMES = list(volumes) + openapi_lib.VOLUMES
+                try:
+                    _, vol = openapi_lib.resolve_volume(input_file.absolute())
+                except SystemExit:
+                    raise SystemExit(
+                        "openapi api spec needs -o/--output <directory> or a "
+                        "matching --volume to determine its output directory"
+                    )
+                if vol.dst is None:
+                    raise SystemExit(
+                        f"api spec {input_file} matched a read-only/dst='-' volume; "
+                        f"cannot infer an output directory"
+                    )
+                api_output_dir = vol.dst
+                api_output_dir.mkdir(parents=True, exist_ok=True)
+            if output_is_file:
+                raise SystemExit(
+                    f"-o {output} points at a file; api specs need an output directory"
+                )
             openapi_go.run_api(
                 input_file=input_file,
-                output_dir=output,
+                output_dir=api_output_dir,
                 volumes=volumes,
                 extra=extra,
                 output_basename_suffix=args.output_basename_suffix,
             )
             continue
 
-        if output is not None:
-            openapi_go.run_definitions(input_file=input_file, output_file=output)
+        # Definitions input.
+        if output_is_file:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            openapi_go.run_definitions(
+                input_file=input_file, output_file=output, volumes=volumes
+            )
             continue
-
-        openapi_go.run_auto(
-            input_file=input_file,
-            output=None,
-            volumes=volumes,
-            extra=extra,
-            output_basename_suffix=args.output_basename_suffix,
-        )
+        # `-o` either was a dir (already injected as a volume above) or was
+        # omitted; either way, let the volume system decide the output.
+        openapi_go.run_definitions(input_file=input_file, output_file=None, volumes=volumes)
 
 
 def _run_sql(args: argparse.Namespace) -> None:
@@ -154,7 +203,27 @@ def _run_sql(args: argparse.Namespace) -> None:
     sql_tests_go.run(sql_dir=sql_dir, output_file=args.output)
 
 
+def _run_config(argv: list[str]) -> int:
+    """`cg config <topic> [flags]` — manage persistent configuration."""
+    parser = argparse.ArgumentParser(prog="cg config", description="manage cg configuration")
+    sub = parser.add_subparsers(dest="topic", required=True)
+    providers = sub.add_parser("providers", help="manage openapi source providers (tokens)")
+    group = providers.add_mutually_exclusive_group(required=True)
+    group.add_argument("--get", action="store_true", help="print configured providers (tokens masked)")
+    group.add_argument("--set", action="store_true", help="add or update a provider (interactive)")
+    args = parser.parse_args(argv)
+    if args.topic == "providers":
+        if args.get:
+            return config.cmd_get()
+        if args.set:
+            return config.cmd_set()
+    return 2
+
+
 def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "config":
+        sys.exit(_run_config(argv[1:]))
     args = _build_parser().parse_args(argv)
     openapi_lib.OUTPUT_TYPE = args.dst_type
     if args.src_type == SRC_OPENAPI:

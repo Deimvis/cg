@@ -226,15 +226,17 @@ def _match_volume_against(openapi_fp: Path, volumes: list[Volume]) -> tuple[str,
                 if vol.src.rstrip('/') == source_url.rstrip('/'):
                     matches.append((0, '', vol))
     else:
+        openapi_resolved = openapi_fp.resolve()
         for vol in volumes:
             if not isinstance(vol.src, Path):
                 continue
-            if vol.src == openapi_fp:
+            vol_resolved = vol.src.resolve()
+            if vol_resolved == openapi_resolved:
                 matches.append((0, '', vol))
                 continue
-            for i in range(len(openapi_fp.parents)):
-                if openapi_fp.parents[i] == vol.src:
-                    rel = str(openapi_fp.relative_to(vol.src))
+            for i, parent in enumerate(openapi_resolved.parents):
+                if parent == vol_resolved:
+                    rel = str(openapi_resolved.relative_to(vol_resolved))
                     matches.append((i, rel, vol))
                     break
 

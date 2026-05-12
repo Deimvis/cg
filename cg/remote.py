@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -99,6 +100,39 @@ def normalize_url(url: str) -> str:
     return url
 
 
+def _gitlab_api_url(canonical: str) -> str | None:
+    """Translate a normalized GitLab `/-/raw/<ref>/<path>` URL into the
+    GitLab REST API form `/api/v4/projects/<id>/repository/files/<path>/raw?ref=<ref>`.
+
+    Some corp GitLab deployments protect web routes (`/-/raw/...`) behind a
+    browser session even when a valid `PRIVATE-TOKEN` is supplied; the REST
+    API route honors the token. Returns None if `canonical` doesn't match
+    the expected `/-/raw/` shape.
+    """
+    parsed = urllib.parse.urlparse(canonical)
+    if not _looks_like_gitlab(parsed):
+        return None
+    parts = [p for p in parsed.path.split("/") if p]
+    if "-" not in parts:
+        return None
+    idx = parts.index("-")
+    if idx < 2 or idx + 2 >= len(parts) or parts[idx + 1] != "raw":
+        return None
+    namespace = parts[:idx]  # e.g. ['ai', 'godzen'] or ['group', 'sub', 'repo']
+    ref = parts[idx + 2]
+    file_path = "/".join(parts[idx + 3:])
+    if not file_path:
+        return None
+    project = "/".join(namespace)
+    encoded_project = urllib.parse.quote(project, safe="")
+    encoded_path = urllib.parse.quote(file_path, safe="")
+    encoded_ref = urllib.parse.quote(ref, safe="")
+    new_path = f"/api/v4/projects/{encoded_project}/repository/files/{encoded_path}/raw"
+    return urllib.parse.urlunparse(
+        parsed._replace(path=new_path, query=f"ref={encoded_ref}")
+    )
+
+
 def _cache_dir() -> Path:
     global _CACHE_DIR
     if _CACHE_DIR is None:
@@ -122,14 +156,107 @@ def fetch(url: str) -> Path:
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
     local = _cache_dir() / f"{digest}-{basename}"
 
-    req = urllib.request.Request(canonical, headers={"User-Agent": "cg-codegen"})
-    with urllib.request.urlopen(req) as resp:
-        data = resp.read()
+    headers = {"User-Agent": "cg-codegen"}
+    auth_headers = _auth_headers_for(parsed)
+    sent_token = bool(auth_headers)
+    for header_name, value in auth_headers.items():
+        headers[header_name] = value
+
+    # For GitLab with a configured token, fetch via the REST API instead of
+    # the `/-/raw/` web route — some corp deployments protect web routes
+    # behind a session and ignore `PRIVATE-TOKEN`, but honor it on the API.
+    request_url = canonical
+    if sent_token and _looks_like_gitlab(parsed):
+        api_url = _gitlab_api_url(canonical)
+        if api_url is not None:
+            request_url = api_url
+
+    req = urllib.request.Request(request_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "")
+            final_url = resp.geturl()
+    except urllib.error.HTTPError as e:
+        # 401/403/404 from any forge means we either need a token or the
+        # token we sent doesn't grant access (or the path is wrong, which
+        # for private repos GitHub reports as 404 indistinguishably).
+        if e.code in (401, 403, 404):
+            raise SystemExit(
+                f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.\n"
+                f"{_auth_hint(parsed, sent_token=sent_token, status=e.code)}"
+            )
+        raise SystemExit(f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.")
+
+    # Detect the other common failure mode: a forge returned 200 OK with an
+    # HTML login page instead of the file. Without this check, we'd silently
+    # write HTML to the `.yaml` cache and pyyaml would choke later.
+    if "html" in content_type.lower() and basename.endswith(".yaml"):
+        raise SystemExit(
+            f"fetch failed: {canonical} returned HTML (Content-Type: {content_type!r}, "
+            f"final URL: {final_url}).\n"
+            f"{_auth_hint(parsed, sent_token=sent_token, status=200)}"
+        )
+
     local.write_bytes(data)
 
     _CACHE_PATH_BY_URL[canonical] = local
     _URL_BY_CACHE_PATH[local] = canonical
     return local
+
+
+def _token_for(netloc: str) -> str | None:
+    """Resolve the auth token for `netloc` from `~/.config/cg/openapi_providers.json`."""
+    from . import config
+    return config.token_for_domain(netloc)
+
+
+def _auth_headers_for(parsed: urllib.parse.ParseResult) -> dict[str, str]:
+    """Auth headers to send with a request, based on the target host."""
+    netloc = parsed.netloc
+    token = _token_for(netloc)
+    if not token:
+        return {}
+    if netloc == "gitlab.com" or netloc.startswith("gitlab."):
+        return {"PRIVATE-TOKEN": token}
+    if netloc in ("github.com", "raw.githubusercontent.com"):
+        return {"Authorization": f"Bearer {token}"}
+    # Unknown forge but a token was configured for this host; default to
+    # the Bearer scheme (works for most APIs).
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _auth_hint(parsed: urllib.parse.ParseResult, *, sent_token: bool = False, status: int = 0) -> str:
+    """Build an actionable hint for an auth-related fetch failure. The text
+    differs depending on whether we sent a token at all and which status the
+    server returned."""
+    netloc = parsed.netloc
+    is_gitlab = netloc == "gitlab.com" or netloc.startswith("gitlab.")
+    is_github = netloc in ("github.com", "raw.githubusercontent.com")
+    forge = "gitlab" if is_gitlab else ("github" if is_github else None)
+    scope = "read_repository" if is_gitlab else ("repo" if is_github else "read")
+
+    setup_lines = [
+        f"  cg config providers --set              # interactive, saves to ~/.config/cg",
+    ]
+
+    if sent_token:
+        head = (
+            f"a token is configured for {netloc!r} but the server rejected it "
+            f"(HTTP {status}). Check that the token is valid and has the "
+            f"`{scope}` scope, and that it can access this specific repository/path."
+        )
+        if forge:
+            head += (
+                f" If you need to use a different token for this host, update it with "
+                f"`cg config providers --set`."
+            )
+        return head
+    head = (
+        f"the request was unauthenticated and the server returned HTTP {status}. "
+        f"If this repository is private, configure a token for {netloc!r}:"
+    )
+    return head + "\n" + "\n".join(setup_lines)
 
 
 def url_of_cache_path(path: Path) -> str | None:
