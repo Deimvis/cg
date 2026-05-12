@@ -392,7 +392,7 @@ def merge_go_tags(raw_tags1: str, raw_tags2: str) -> str:
 
 
 class ProgrammingLanguage(str, Enum):
-    Golang = 'golang'
+    Go = 'go'
 
 
 class ModelField:
@@ -621,7 +621,7 @@ def generate_golang_definition_ref(openapi_fp: Path, ref_value: str) -> tuple[st
         PROCESSED_FILES.append(ref_fp)
         _, ref_vol = resolve_volume(ref_fp)
         if not ref_vol.read_only:
-            handle_definitions_file(ref_fp, get_out_fp(ref_fp), ProgrammingLanguage.Golang)
+            handle_definitions_file(ref_fp, get_out_fp(ref_fp), ProgrammingLanguage.Go)
 
     ref_schema = get_def_schema(ref_fp, def_path)
     tags = ''

@@ -39,7 +39,7 @@ def run_api(
     if output_basename_suffix is not None:
         openapi_lib.CODEGEN_FILE_NAME_SUFFIX = output_basename_suffix
 
-    handle_api_file(input_file.absolute(), output_dir.absolute(), ProgrammingLanguage.Golang)
+    handle_api_file(input_file.absolute(), output_dir.absolute(), ProgrammingLanguage.Go)
 
     if extra:
         for p in extra:
@@ -49,7 +49,7 @@ def run_api(
                 fp = Path(p) if not isinstance(p, Path) else p
                 assert fp.is_file()
                 fp = fp.absolute()
-            handle_definitions_file(fp, get_out_fp(fp), ProgrammingLanguage.Golang)
+            handle_definitions_file(fp, get_out_fp(fp), ProgrammingLanguage.Go)
 
     _gofmt(output_dir.absolute())
     for d in {f.parent for f in GENERATED_OUT_FILES}:
@@ -70,7 +70,7 @@ def run_definitions(
     else:
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    handle_definitions_file(input_file, output_file, ProgrammingLanguage.Golang)
+    handle_definitions_file(input_file, output_file, ProgrammingLanguage.Go)
 
     _gofmt(output_file.parent.absolute())
     for d in {f.parent for f in GENERATED_OUT_FILES}:
