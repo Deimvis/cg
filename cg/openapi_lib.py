@@ -312,22 +312,31 @@ def _file_default_volume(openapi_fp: Path) -> Volume | None:
                 f'{openapi_fp}: default_volume.imports.{lang} is reserved; only null is supported'
             )
 
+    src: Path | str
+    source_url = remote.url_of_cache_path(openapi_fp)
+    src = source_url if source_url is not None else openapi_fp
+
     dst: Path | None
     if dst_raw == '-':
         dst = None
+    elif source_url is not None:
+        # Remote-fetched file: the cache parent is a meaningless tempdir, so we
+        # resolve `dst` against the URL's directory and store the resolved URL
+        # itself as a Path. `Path.name` then yields the URL's final segment,
+        # which becomes the Go package qualifier — matching the upstream repo's
+        # actual layout. Such files are always read_only — we never write into
+        # a fetched remote source.
+        read_only = True
+        url_dir = source_url.rsplit('/', 1)[0] + '/'
+        resolved_url = urllib.parse.urljoin(url_dir, dst_raw).rstrip('/')
+        dst = Path(resolved_url)
     else:
         dst_path = Path(os.path.expanduser(dst_raw))
         if dst_path.is_absolute():
             dst = dst_path
         else:
-            # Relative to the directory of the openapi file. For URL-sourced
-            # files we still resolve against the local cache parent; output
-            # dirs for remote read-only libs typically use absolute paths.
+            # Relative to the directory of the openapi file.
             dst = (openapi_fp.parent / dst_path).resolve()
-
-    src: Path | str
-    source_url = remote.url_of_cache_path(openapi_fp)
-    src = source_url if source_url is not None else openapi_fp
 
     vol = Volume(src=src, dst=dst, read_only=read_only, checks=checks, imports=imports_raw)
     _DEFAULT_VOLUME_CACHE[openapi_fp] = vol
