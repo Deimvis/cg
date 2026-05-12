@@ -80,8 +80,10 @@ def _expand_openapi_input(raw_input: str) -> tuple[list[Path], Path | str]:
     user doesn't have to pass a redundant `-v` alongside `-o`.
     """
     if remote.is_url(raw_input):
-        canonical = remote.normalize_url(raw_input)
         fetched = remote.fetch(raw_input)
+        # Use the actual canonical URL that `fetch` resolved to (may differ
+        # from `normalize_url` when the convenience-form fell back to master).
+        canonical = remote.url_of_cache_path(fetched) or remote.normalize_url(raw_input)
         return [fetched], canonical
 
     if raw_input.endswith("/**"):

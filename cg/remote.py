@@ -36,35 +36,35 @@ def _looks_like_gitlab(parsed: urllib.parse.ParseResult) -> bool:
     return "/-/blob/" in parsed.path or "/-/raw/" in parsed.path
 
 
-def _normalize_github(parsed: urllib.parse.ParseResult) -> str:
+_DEFAULT_BRANCHES = ("main", "master")
+
+
+def _normalize_github(parsed: urllib.parse.ParseResult, default_ref: str = "main") -> str:
     parts = [p for p in parsed.path.split("/") if p]
     if len(parts) < 3:
         return urllib.parse.urlunparse(parsed)
     owner, repo, *rest = parts
     if rest and rest[0] in ("blob", "raw"):
-        # github.com/owner/repo/blob/<ref>/<path> -> raw.githubusercontent.com/owner/repo/<ref>/<path>
         ref_and_path = rest[1:]
         new_path = "/".join([owner, repo, *ref_and_path])
         return urllib.parse.urlunparse(parsed._replace(netloc="raw.githubusercontent.com", path="/" + new_path))
-    # Convenience form: assume default branch `main`.
-    new_path = "/".join([owner, repo, "main", *rest])
+    new_path = "/".join([owner, repo, default_ref, *rest])
     return urllib.parse.urlunparse(parsed._replace(netloc="raw.githubusercontent.com", path="/" + new_path))
 
 
-def _normalize_gitlab(parsed: urllib.parse.ParseResult) -> str:
+def _normalize_gitlab(parsed: urllib.parse.ParseResult, default_ref: str = "main") -> str:
     """Normalize gitlab.com (and self-hosted gitlab) URLs to their raw form.
 
     Accepts:
       - .../<namespace>/<repo>/-/blob/<ref>/<path> -> .../<namespace>/<repo>/-/raw/<ref>/<path>
       - .../<namespace>/<repo>/-/raw/<ref>/<path>  (passthrough)
-      - .../<owner>/<repo>/<path>                   -> .../<owner>/<repo>/-/raw/main/<path>
+      - .../<owner>/<repo>/<path>                   -> .../<owner>/<repo>/-/raw/<default_ref>/<path>
 
     For repos in nested groups (`group/sub/repo`), the convenience form is
     ambiguous; use the explicit `/-/blob/<ref>/...` or `/-/raw/<ref>/...`
     form so cg can find the project/path boundary.
     """
     parts = [p for p in parsed.path.split("/") if p]
-    # Find the `-` separator that splits namespace+repo from blob/raw+ref+path.
     if "-" in parts:
         idx = parts.index("-")
         if idx >= 2 and idx + 2 < len(parts) and parts[idx + 1] in ("blob", "raw"):
@@ -73,31 +73,58 @@ def _normalize_gitlab(parsed: urllib.parse.ParseResult) -> str:
             new_parts = namespace + ["-", "raw", ref, *rest]
             return urllib.parse.urlunparse(parsed._replace(path="/" + "/".join(new_parts)))
         return urllib.parse.urlunparse(parsed)
-    # Convenience form with no `/-/blob/` marker: assume `main`.
     if len(parts) < 2:
         return urllib.parse.urlunparse(parsed)
     namespace_repo = parts[:2]
     rest = parts[2:]
-    new_parts = namespace_repo + ["-", "raw", "main", *rest]
+    new_parts = namespace_repo + ["-", "raw", default_ref, *rest]
     return urllib.parse.urlunparse(parsed._replace(path="/" + "/".join(new_parts)))
 
 
-def normalize_url(url: str) -> str:
+def _is_convenience_form(url: str) -> bool:
+    """True if the URL doesn't already encode an explicit ref and should
+    therefore be retried against alternate default branches."""
+    parsed = urllib.parse.urlparse(url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if parsed.netloc == "github.com":
+        # github.com/owner/repo/<rest>: convenience iff `rest[0]` isn't blob/raw
+        return len(parts) >= 3 and parts[2] not in ("blob", "raw")
+    if _looks_like_gitlab(parsed):
+        # GitLab convenience form has no `/-/blob/` or `/-/raw/` marker
+        return "-" not in parts
+    return False
+
+
+def normalize_url(url: str, default_ref: str = "main") -> str:
     """Rewrite a known forge URL to its raw-content form.
 
-    - GitHub: github.com/<owner>/<repo>/[blob/<ref>/]<path> -> raw.githubusercontent.com/<owner>/<repo>/<ref-or-main>/<path>
+    - GitHub: github.com/<owner>/<repo>/[blob/<ref>/]<path> -> raw.githubusercontent.com/<owner>/<repo>/<ref-or-default>/<path>
     - GitLab: <host>/<owner>/<repo>/-/blob/<ref>/<path>     -> <host>/<owner>/<repo>/-/raw/<ref>/<path>
-              <host>/<owner>/<repo>/<path>                   -> <host>/<owner>/<repo>/-/raw/main/<path>
+              <host>/<owner>/<repo>/<path>                   -> <host>/<owner>/<repo>/-/raw/<default_ref>/<path>
     Other URLs pass through unchanged.
     """
     if not is_url(url):
         return url
     parsed = urllib.parse.urlparse(url)
     if parsed.netloc == "github.com":
-        return _normalize_github(parsed)
+        return _normalize_github(parsed, default_ref)
     if _looks_like_gitlab(parsed):
-        return _normalize_gitlab(parsed)
+        return _normalize_gitlab(parsed, default_ref)
     return url
+
+
+def _candidate_canonical_urls(url: str) -> list[str]:
+    """Return the URL(s) to try fetching for `url`, in order. For convenience-
+    form forge URLs (no explicit ref), returns `[main-form, master-form]`."""
+    canonical = normalize_url(url)
+    if not _is_convenience_form(url):
+        return [canonical]
+    out = [canonical]
+    for ref in _DEFAULT_BRANCHES[1:]:
+        alt = normalize_url(url, default_ref=ref)
+        if alt != canonical and alt not in out:
+            out.append(alt)
+    return out
 
 
 def _gitlab_api_url(canonical: str) -> str | None:
@@ -140,31 +167,20 @@ def _cache_dir() -> Path:
     return _CACHE_DIR
 
 
-def fetch(url: str) -> Path:
-    """Download `url` (after normalization) into the cache and return the local path.
+class _NotFound(Exception):
+    """Internal: fetch attempt got a 404 (used for ref-fallback in convenience URLs)."""
 
-    Subsequent calls for the same URL return the cached path without re-downloading.
-    The cache file name preserves the original `.yaml` suffix so downstream
-    assertions on `Path.suffix` keep working.
-    """
-    canonical = normalize_url(url)
-    if canonical in _CACHE_PATH_BY_URL:
-        return _CACHE_PATH_BY_URL[canonical]
 
+def _attempt_fetch(canonical: str) -> tuple[bytes, str]:
+    """Single fetch of `canonical`. Returns `(data, content_type)`. Raises
+    `_NotFound` on 404, or `SystemExit` for non-recoverable failures."""
     parsed = urllib.parse.urlparse(canonical)
-    basename = os.path.basename(parsed.path) or "remote.yaml"
-    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
-    local = _cache_dir() / f"{digest}-{basename}"
-
     headers = {"User-Agent": "cg-codegen"}
     auth_headers = _auth_headers_for(parsed)
     sent_token = bool(auth_headers)
     for header_name, value in auth_headers.items():
         headers[header_name] = value
 
-    # For GitLab with a configured token, fetch via the REST API instead of
-    # the `/-/raw/` web route — some corp deployments protect web routes
-    # behind a session and ignore `PRIVATE-TOKEN`, but honor it on the API.
     request_url = canonical
     if sent_token and _looks_like_gitlab(parsed):
         api_url = _gitlab_api_url(canonical)
@@ -178,26 +194,66 @@ def fetch(url: str) -> Path:
             content_type = resp.headers.get("Content-Type", "")
             final_url = resp.geturl()
     except urllib.error.HTTPError as e:
-        # 401/403/404 from any forge means we either need a token or the
-        # token we sent doesn't grant access (or the path is wrong, which
-        # for private repos GitHub reports as 404 indistinguishably).
-        if e.code in (401, 403, 404):
+        if e.code == 404:
+            raise _NotFound()
+        if e.code in (401, 403):
             raise SystemExit(
                 f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.\n"
                 f"{_auth_hint(parsed, sent_token=sent_token, status=e.code)}"
             )
         raise SystemExit(f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.")
 
-    # Detect the other common failure mode: a forge returned 200 OK with an
-    # HTML login page instead of the file. Without this check, we'd silently
-    # write HTML to the `.yaml` cache and pyyaml would choke later.
+    basename = os.path.basename(parsed.path) or "remote.yaml"
     if "html" in content_type.lower() and basename.endswith(".yaml"):
         raise SystemExit(
             f"fetch failed: {canonical} returned HTML (Content-Type: {content_type!r}, "
             f"final URL: {final_url}).\n"
             f"{_auth_hint(parsed, sent_token=sent_token, status=200)}"
         )
+    return data, content_type
 
+
+def fetch(url: str) -> Path:
+    """Download `url` (after normalization) into the cache and return the local path.
+
+    Subsequent calls for the same URL return the cached path without re-downloading.
+    For convenience-form forge URLs without an explicit ref, attempts `main`
+    first and falls back to `master` on 404. The cache file name preserves
+    the original `.yaml` suffix so downstream assertions on `Path.suffix`
+    keep working.
+    """
+    candidates = _candidate_canonical_urls(url)
+    # Reuse the cache via any of the candidate canonical URLs.
+    for c in candidates:
+        if c in _CACHE_PATH_BY_URL:
+            return _CACHE_PATH_BY_URL[c]
+
+    last_404: str | None = None
+    data: bytes | None = None
+    canonical: str | None = None
+    for i, c in enumerate(candidates):
+        try:
+            data, _ = _attempt_fetch(c)
+            canonical = c
+            break
+        except _NotFound:
+            last_404 = c
+            continue
+
+    if data is None or canonical is None:
+        # All candidates 404'd. Report against the last attempt (typically
+        # the master fallback) with full forge auth context.
+        parsed = urllib.parse.urlparse(last_404 or candidates[-1])
+        sent_token = bool(_auth_headers_for(parsed))
+        raise SystemExit(
+            f"fetch failed: all candidate URLs 404'd: {candidates}\n"
+            f"{_auth_hint(parsed, sent_token=sent_token, status=404)}"
+        )
+
+    parsed = urllib.parse.urlparse(canonical)
+    basename = os.path.basename(parsed.path) or "remote.yaml"
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
+    local = _cache_dir() / f"{digest}-{basename}"
     local.write_bytes(data)
 
     _CACHE_PATH_BY_URL[canonical] = local
