@@ -139,9 +139,21 @@ def _run_preserved(merged: dict, input_file: Path) -> None:
             ref_value = node.get("$ref")
             if isinstance(ref_value, str):
                 target, _ = openapi_lib._parse_ref(ref_value)
-                if target == "":
+                # A same-doc ref (`target == ""`) is fine when we are walking
+                # the root document, but inside a hoisted external schema it
+                # points into *that* schema's source file — the referenced
+                # component lives there, not in the output's components. Hoist
+                # it into the output so the pointer is valid.
+                if target == "" and source_file == input_file:
                     return
                 node["$ref"] = hoist(source_file, ref_value)
+                # Walk siblings too: $ref with adjacent keywords is valid in
+                # OpenAPI 3.1 / JSON Schema 2020-12 and those siblings may
+                # themselves contain refs.
+                for k, v in list(node.items()):
+                    if k == "$ref":
+                        continue
+                    walk(v, source_file)
                 return
             for k, v in list(node.items()):
                 if skip_components and k == "components":
@@ -201,24 +213,38 @@ def _run_inlined(merged: dict, input_file: Path) -> None:
                 f"path /{'/'.join(def_path)} not found"
             )
 
-    def replace_at(container: Any, key: Any, source_file: Path, ref_value: str) -> None:
+    def inline_into(node: dict, source_file: Path, ref_value: str) -> Path:
+        """Inline the `$ref` declared in `node` in place: remove the `$ref` key
+        and merge the resolved value into `node`. Sibling keys win on conflict
+        (matches OpenAPI 3.1 / JSON Schema 2020-12 semantics for `$ref` with
+        adjacent keywords). Returns the source file of the resolved value so
+        the caller can keep walking with the right base path."""
         target, def_path = openapi_lib._parse_ref(ref_value)
-        # Same-doc refs (`target == ""`) resolve back to the current source file,
-        # which is what we want: when an inlined external schema contains
-        # `$ref: '#/components/schemas/X'`, X lives in the file the schema came
-        # from — not in the root output document. Inline it from there too.
+        # Same-doc refs (`target == ""`) resolve back to the current source
+        # file: when an inlined external schema contains `$ref: '#/...X'`, X
+        # lives in the file the schema came from — not in the root output.
         ref_fp = openapi_lib._resolve_ref_target(source_file, target)
         frame = (ref_fp, tuple(def_path))
         if frame in stack:
             cycle = " -> ".join(f"{_source_label(fp)}#/{'/'.join(p)}" for fp, p in stack + [frame])
             raise SystemExit(f"openapi/standalone: ref cycle detected: {cycle}")
         resolved = resolve_or_die(ref_fp, def_path, source_file, ref_value)
-        container[key] = copy.deepcopy(resolved)
-        stack.append(frame)
-        try:
-            walk(container[key], ref_fp, container, key)
-        finally:
-            stack.pop()
+        siblings = {k: v for k, v in node.items() if k != "$ref"}
+        if not isinstance(resolved, dict):
+            if siblings:
+                raise SystemExit(
+                    f"openapi/standalone (inlined-schemas): cannot merge $ref {ref_value!r} "
+                    f"whose resolved value is not a mapping ({type(resolved).__name__}) "
+                    f"with sibling keys {sorted(siblings)!r}"
+                )
+            # No siblings: the parent will replace this whole node. We can't
+            # do that from here without the parent reference; punt to caller.
+            return ref_fp  # type: ignore[return-value]
+        node.clear()
+        node.update(copy.deepcopy(resolved))
+        # Sibling keys win on conflict.
+        node.update(siblings)
+        return ref_fp
 
     def walk(node: Any, source_file: Path, parent: Any = None, parent_key: Any = None) -> None:
         if isinstance(node, dict):
@@ -228,7 +254,32 @@ def _run_inlined(merged: dict, input_file: Path) -> None:
                     raise SystemExit(
                         "openapi/standalone: refusing to inline a $ref at the document root"
                     )
-                replace_at(parent, parent_key, source_file, ref_value)
+                target, def_path = openapi_lib._parse_ref(ref_value)
+                ref_fp = openapi_lib._resolve_ref_target(source_file, target)
+                frame = (ref_fp, tuple(def_path))
+                resolved = resolve_or_die(ref_fp, def_path, source_file, ref_value)
+                if not isinstance(resolved, dict):
+                    # Scalar/list target with no siblings: replace the whole
+                    # parent slot. With siblings, error.
+                    siblings = {k: v for k, v in node.items() if k != "$ref"}
+                    if siblings:
+                        raise SystemExit(
+                            f"openapi/standalone (inlined-schemas): cannot merge $ref {ref_value!r} "
+                            f"whose resolved value is not a mapping ({type(resolved).__name__}) "
+                            f"with sibling keys {sorted(siblings)!r}"
+                        )
+                    if frame in stack:
+                        cycle = " -> ".join(f"{_source_label(fp)}#/{'/'.join(p)}" for fp, p in stack + [frame])
+                        raise SystemExit(f"openapi/standalone: ref cycle detected: {cycle}")
+                    parent[parent_key] = copy.deepcopy(resolved)
+                    return
+                # Dict target: inline into the same node, preserving siblings.
+                inline_into(node, source_file, ref_value)
+                stack.append(frame)
+                try:
+                    walk(node, ref_fp, parent, parent_key)
+                finally:
+                    stack.pop()
                 return
             for k, v in list(node.items()):
                 walk(v, source_file, node, k)
