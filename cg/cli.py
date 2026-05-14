@@ -280,19 +280,31 @@ def _resolve_impl(args: argparse.Namespace) -> None:
 
 
 def _run_config(argv: list[str]) -> int:
-    """`cg config <topic> [flags]` — manage persistent configuration."""
+    """`cg config <topic> [action] [args]` — manage persistent configuration."""
     parser = argparse.ArgumentParser(prog="cg config", description="manage cg configuration")
     sub = parser.add_subparsers(dest="topic", required=True)
+
     providers = sub.add_parser("providers", help="manage openapi source providers (tokens)")
-    group = providers.add_mutually_exclusive_group(required=True)
-    group.add_argument("--get", action="store_true", help="print configured providers (tokens masked)")
-    group.add_argument("--set", action="store_true", help="add or update a provider (interactive)")
+    providers_actions = providers.add_subparsers(dest="action")
+    add = providers_actions.add_parser(
+        "add",
+        help=(
+            "add or update a provider. With no positional args, prompts "
+            "interactively. With all three, runs non-interactively (suitable "
+            "for CI)."
+        ),
+    )
+    add.add_argument("provider", nargs="?", choices=config.PROVIDERS, help="provider kind")
+    add.add_argument("domain", nargs="?", help="domain, e.g. gitlab.com or github.corp.example")
+    add.add_argument("token", nargs="?", help="auth token")
+
     args = parser.parse_args(argv)
-    if args.topic == "providers":
-        if args.get:
-            return config.cmd_get()
-        if args.set:
-            return config.cmd_set()
+    if args.topic != "providers":
+        return 2
+    if args.action is None:
+        return config.cmd_list()
+    if args.action == "add":
+        return config.cmd_add(args.provider, args.domain, args.token)
     return 2
 
 

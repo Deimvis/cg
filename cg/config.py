@@ -108,7 +108,7 @@ def render_masked(data: dict[str, list[dict[str, str]]]) -> str:
     return json.dumps(masked, indent=2) + "\n"
 
 
-def cmd_get() -> int:
+def cmd_list() -> int:
     data = load_providers()
     if not data:
         print(f"(no providers configured at {providers_path()})")
@@ -131,15 +131,7 @@ def _prompt(label: str, choices: tuple[str, ...] | None = None) -> str:
         return val
 
 
-def cmd_set() -> int:
-    provider = _prompt("Provider", PROVIDERS)
-    default_domain = "github.com" if provider == "github" else "gitlab.com"
-    raw_domain = input(f"Domain [{default_domain}]: ").strip()
-    domain = raw_domain or default_domain
-    token = getpass.getpass("Token (hidden): ").strip()
-    if not token:
-        raise SystemExit("token required")
-
+def _upsert(provider: str, domain: str, token: str) -> tuple[Path, bool]:
     data = load_providers()
     entries = data.setdefault(provider, [])
     updated = False
@@ -150,8 +142,40 @@ def cmd_set() -> int:
             break
     if not updated:
         entries.append({"domain": domain, "token": token})
+    return save_providers(data), updated
 
-    path = save_providers(data)
+
+def cmd_add(provider: str | None, domain: str | None, token: str | None) -> int:
+    """Add or update a provider. All three args present → non-interactive.
+    All three absent → interactive prompts. Any other partial combination is
+    a usage error."""
+    supplied = [v for v in (provider, domain, token) if v is not None]
+    if len(supplied) not in (0, 3):
+        raise SystemExit(
+            "cg config providers add: pass either no positional args (interactive) "
+            "or all three: <provider> <domain> <token>"
+        )
+
+    if not supplied:
+        provider = _prompt("Provider", PROVIDERS)
+        default_domain = "github.com" if provider == "github" else "gitlab.com"
+        raw_domain = input(f"Domain [{default_domain}]: ").strip()
+        domain = raw_domain or default_domain
+        token = getpass.getpass("Token (hidden): ").strip()
+        if not token:
+            raise SystemExit("token required")
+    else:
+        assert provider is not None and domain is not None and token is not None
+        if provider not in PROVIDERS:
+            raise SystemExit(
+                f"unknown provider {provider!r}; expected one of: {', '.join(PROVIDERS)}"
+            )
+        if not domain:
+            raise SystemExit("domain must be non-empty")
+        if not token:
+            raise SystemExit("token must be non-empty")
+
+    path, updated = _upsert(provider, domain, token)
     action = "updated" if updated else "added"
     print(f"{action} {provider}/{domain} in {path}")
     return 0
