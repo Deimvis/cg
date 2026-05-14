@@ -13,6 +13,13 @@ DST_GO = "go"
 DST_GO_TESTS = "go/tests"
 
 
+# Allowed --impl values per (src_type, dst_type). First entry is the default.
+# Pairs absent from this map don't accept --impl.
+IMPLS_BY_PAIR: dict[tuple[str, str], list[str]] = {
+    (SRC_SQL, DST_GO_TESTS): sql_tests_go.IMPLS,
+}
+
+
 def _parse_volumes(raw: list[str] | None) -> list[openapi_lib.Volume]:
     if not raw:
         return []
@@ -63,6 +70,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Customize suffix for generated file names",
+    )
+    p.add_argument(
+        "--impl",
+        type=str,
+        default=None,
+        help=(
+            "Implementation variant for the given --src-type/--dst-type pair. "
+            "For sql -> go/tests: "
+            f"{', '.join(sql_tests_go.IMPLS)} "
+            f"(default: {sql_tests_go.DEFAULT_IMPL})."
+        ),
     )
     return p
 
@@ -202,7 +220,25 @@ def _run_sql(args: argparse.Namespace) -> None:
     sql_dir = Path(args.input)
     if not sql_dir.is_dir():
         raise SystemExit(f"input must be a directory for sql codegen: {sql_dir}")
-    sql_tests_go.run(sql_dir=sql_dir, output_file=args.output)
+    impl = args.impl or sql_tests_go.DEFAULT_IMPL
+    sql_tests_go.run(sql_dir=sql_dir, output_file=args.output, impl=impl)
+
+
+def _resolve_impl(args: argparse.Namespace) -> None:
+    """Validate --impl against the (src_type, dst_type) pair."""
+    pair = (args.src_type, args.dst_type)
+    allowed = IMPLS_BY_PAIR.get(pair)
+    if args.impl is None:
+        return
+    if allowed is None:
+        raise SystemExit(
+            f"--impl is not supported for --src-type={args.src_type} --dst-type={args.dst_type}"
+        )
+    if args.impl not in allowed:
+        raise SystemExit(
+            f"unsupported --impl {args.impl!r} for --src-type={args.src_type} "
+            f"--dst-type={args.dst_type}; allowed: {', '.join(allowed)}"
+        )
 
 
 def _run_config(argv: list[str]) -> int:
@@ -227,6 +263,7 @@ def main(argv: list[str] | None = None) -> None:
     if argv and argv[0] == "config":
         sys.exit(_run_config(argv[1:]))
     args = _build_parser().parse_args(argv)
+    _resolve_impl(args)
     openapi_lib.OUTPUT_TYPE = args.dst_type
     if args.src_type == SRC_OPENAPI:
         _run_openapi(args)
