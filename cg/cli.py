@@ -3,7 +3,7 @@ from pathlib import Path
 
 import sys
 
-from . import config, openapi_go, openapi_lib, remote, sql_tests_go
+from . import config, openapi_go, openapi_lib, openapi_merge, remote, sql_tests_go
 
 
 SRC_OPENAPI = "openapi"
@@ -11,12 +11,14 @@ SRC_SQL = "sql"
 
 DST_GO = "go"
 DST_GO_TESTS = "go/tests"
+DST_OPENAPI_STANDALONE = "openapi/standalone"
 
 
 # Allowed --impl values per (src_type, dst_type). First entry is the default.
 # Pairs absent from this map don't accept --impl.
 IMPLS_BY_PAIR: dict[tuple[str, str], list[str]] = {
     (SRC_SQL, DST_GO_TESTS): sql_tests_go.IMPLS,
+    (SRC_OPENAPI, DST_OPENAPI_STANDALONE): openapi_merge.IMPLS,
 }
 
 
@@ -32,7 +34,7 @@ def _parse_volumes(raw: list[str] | None) -> list[openapi_lib.Volume]:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cg", description="codegen entrypoint")
     p.add_argument("--src-type", required=True, choices=[SRC_OPENAPI, SRC_SQL])
-    p.add_argument("--dst-type", required=True, choices=[DST_GO, DST_GO_TESTS])
+    p.add_argument("--dst-type", required=True, choices=[DST_GO, DST_GO_TESTS, DST_OPENAPI_STANDALONE])
     p.add_argument(
         "input",
         type=str,
@@ -79,7 +81,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Implementation variant for the given --src-type/--dst-type pair. "
             "For sql -> go/tests: "
             f"{', '.join(sql_tests_go.IMPLS)} "
-            f"(default: {sql_tests_go.DEFAULT_IMPL})."
+            f"(default: {sql_tests_go.DEFAULT_IMPL}). "
+            "For openapi -> openapi/standalone: "
+            f"{', '.join(openapi_merge.IMPLS)} "
+            f"(default: {openapi_merge.DEFAULT_IMPL})."
         ),
     )
     return p
@@ -129,8 +134,14 @@ def _expand_openapi_input(raw_input: str) -> tuple[list[Path], Path | str]:
 
 
 def _run_openapi(args: argparse.Namespace) -> None:
+    if args.dst_type == DST_OPENAPI_STANDALONE:
+        _run_openapi_standalone(args)
+        return
     if args.dst_type != DST_GO:
-        raise SystemExit(f"--dst-type {args.dst_type} is not supported for openapi (use {DST_GO})")
+        raise SystemExit(
+            f"--dst-type {args.dst_type} is not supported for openapi "
+            f"(use {DST_GO} or {DST_OPENAPI_STANDALONE})"
+        )
 
     input_files, input_root = _expand_openapi_input(args.input)
 
@@ -208,6 +219,33 @@ def _run_openapi(args: argparse.Namespace) -> None:
         # `-o` either was a dir (already injected as a volume above) or was
         # omitted; either way, let the volume system decide the output.
         openapi_go.run_definitions(input_file=input_file, output_file=None, volumes=volumes)
+
+
+def _run_openapi_standalone(args: argparse.Namespace) -> None:
+    if args.output is None:
+        raise SystemExit(f"--dst-type {DST_OPENAPI_STANDALONE} requires -o/--output <file>")
+    if args.output.exists() and args.output.is_dir():
+        raise SystemExit(
+            f"--dst-type {DST_OPENAPI_STANDALONE} requires -o to be a file path, got directory: {args.output}"
+        )
+    if args.volume:
+        raise SystemExit(f"--volume is not supported for --dst-type {DST_OPENAPI_STANDALONE}")
+    if args.extra:
+        raise SystemExit(f"--extra is not supported for --dst-type {DST_OPENAPI_STANDALONE}")
+    if args.output_basename_suffix is not None:
+        raise SystemExit(
+            f"--output-basename-suffix is not supported for --dst-type {DST_OPENAPI_STANDALONE}"
+        )
+
+    input_files, _ = _expand_openapi_input(args.input)
+    if len(input_files) != 1:
+        raise SystemExit(
+            f"--dst-type {DST_OPENAPI_STANDALONE} requires exactly one input file "
+            f"(got {len(input_files)})"
+        )
+
+    impl = args.impl or openapi_merge.DEFAULT_IMPL
+    openapi_merge.run(input_file=input_files[0], output_file=args.output, impl=impl)
 
 
 def _run_sql(args: argparse.Namespace) -> None:
