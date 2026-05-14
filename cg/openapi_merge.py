@@ -56,13 +56,23 @@ def run(input_file: Path, output_file: Path, impl: str) -> None:
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with output_file.open("w") as f:
-        yaml.safe_dump(
+        yaml.dump(
             merged,
             f,
+            Dumper=_IndentedDumper,
             sort_keys=False,
             allow_unicode=True,
             default_flow_style=False,
+            indent=2,
         )
+
+
+class _IndentedDumper(yaml.SafeDumper):
+    """SafeDumper that indents list dashes under their parent key instead of
+    rendering them flush-left (PyYAML's default "indentless" sequence style)."""
+
+    def increase_indent(self, flow: bool = False, indentless: bool = False):  # type: ignore[override]
+        return super().increase_indent(flow, False)
 
 
 def _source_label(fp: Path) -> str:
