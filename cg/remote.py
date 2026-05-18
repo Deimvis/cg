@@ -113,17 +113,47 @@ def normalize_url(url: str, default_ref: str = "main") -> str:
     return url
 
 
-def _candidate_canonical_urls(url: str) -> list[str]:
-    """Return the URL(s) to try fetching for `url`, in order. For convenience-
-    form forge URLs (no explicit ref), returns `[main-form, master-form]`."""
-    canonical = normalize_url(url)
+def _apply_http_mirror(url: str) -> tuple[str, str]:
+    """Return `(possibly_rewritten_url, original_host)`. If the URL's host
+    has an http mirror configured in `~/.config/cg/openapi_providers.json`
+    under `mirrors.http`, rewrite the URL to that mirror prefix while
+    preserving the original path, query, and fragment. The second tuple
+    element is always the *original* host so auth headers can still be
+    keyed by it."""
+    if not is_url(url):
+        return url, urllib.parse.urlparse(url).netloc
+    parsed = urllib.parse.urlparse(url)
+    from . import config
+    prefix = config.http_mirror_for(parsed.netloc)
+    if prefix is None:
+        return url, parsed.netloc
+    prefix_parsed = urllib.parse.urlparse(prefix)
+    prefix_path = prefix_parsed.path.rstrip("/")
+    new_path = prefix_path + parsed.path
+    new_url = urllib.parse.urlunparse((
+        prefix_parsed.scheme,
+        prefix_parsed.netloc,
+        new_path,
+        "",
+        parsed.query,
+        parsed.fragment,
+    ))
+    return new_url, parsed.netloc
+
+
+def _candidate_canonical_urls(url: str) -> list[tuple[str, str]]:
+    """Return the URL(s) to try fetching for `url`, in order, paired with
+    the *auth host* to use for each. For convenience-form forge URLs (no
+    explicit ref), returns `[main-form, master-form]` candidates."""
+    rewritten, auth_host = _apply_http_mirror(url)
+    canonical = normalize_url(rewritten)
     if not _is_convenience_form(url):
-        return [canonical]
-    out = [canonical]
+        return [(canonical, auth_host)]
+    out: list[tuple[str, str]] = [(canonical, auth_host)]
     for ref in _DEFAULT_BRANCHES[1:]:
-        alt = normalize_url(url, default_ref=ref)
-        if alt != canonical and alt not in out:
-            out.append(alt)
+        alt = normalize_url(rewritten, default_ref=ref)
+        if alt != canonical and not any(alt == c for c, _ in out):
+            out.append((alt, auth_host))
     return out
 
 
@@ -171,18 +201,24 @@ class _NotFound(Exception):
     """Internal: fetch attempt got a 404 (used for ref-fallback in convenience URLs)."""
 
 
-def _attempt_fetch(canonical: str) -> tuple[bytes, str]:
+def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
     """Single fetch of `canonical`. Returns `(data, content_type)`. Raises
-    `_NotFound` on 404, or `SystemExit` for non-recoverable failures."""
+    `_NotFound` on 404, or `SystemExit` for non-recoverable failures.
+
+    `auth_host` is the *original* host (pre-mirror) used to look up auth
+    credentials. The actual request goes to `canonical`. When `auth_host`
+    differs from the request host, the GitLab REST-API rewrite is skipped
+    (mirrors typically don't expose `/api/v4`)."""
     parsed = urllib.parse.urlparse(canonical)
+    auth_parsed = parsed._replace(netloc=auth_host)
     headers = {"User-Agent": "cg-codegen"}
-    auth_headers = _auth_headers_for(parsed)
+    auth_headers = _auth_headers_for(auth_parsed)
     sent_token = bool(auth_headers)
     for header_name, value in auth_headers.items():
         headers[header_name] = value
 
     request_url = canonical
-    if sent_token and _looks_like_gitlab(parsed):
+    if sent_token and auth_host == parsed.netloc and _looks_like_gitlab(parsed):
         api_url = _gitlab_api_url(canonical)
         if api_url is not None:
             request_url = api_url
@@ -199,7 +235,7 @@ def _attempt_fetch(canonical: str) -> tuple[bytes, str]:
         if e.code in (401, 403):
             raise SystemExit(
                 f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.\n"
-                f"{_auth_hint(parsed, sent_token=sent_token, status=e.code)}"
+                f"{_auth_hint(auth_parsed, sent_token=sent_token, status=e.code)}"
             )
         raise SystemExit(f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.")
 
@@ -208,7 +244,7 @@ def _attempt_fetch(canonical: str) -> tuple[bytes, str]:
         raise SystemExit(
             f"fetch failed: {canonical} returned HTML (Content-Type: {content_type!r}, "
             f"final URL: {final_url}).\n"
-            f"{_auth_hint(parsed, sent_token=sent_token, status=200)}"
+            f"{_auth_hint(auth_parsed, sent_token=sent_token, status=200)}"
         )
     return data, content_type
 
@@ -224,30 +260,33 @@ def fetch(url: str) -> Path:
     """
     candidates = _candidate_canonical_urls(url)
     # Reuse the cache via any of the candidate canonical URLs.
-    for c in candidates:
+    for c, _ in candidates:
         if c in _CACHE_PATH_BY_URL:
             return _CACHE_PATH_BY_URL[c]
 
-    last_404: str | None = None
+    last_404: tuple[str, str] | None = None
     data: bytes | None = None
     canonical: str | None = None
-    for i, c in enumerate(candidates):
+    for c, auth_host in candidates:
         try:
-            data, _ = _attempt_fetch(c)
+            data, _ = _attempt_fetch(c, auth_host)
             canonical = c
             break
         except _NotFound:
-            last_404 = c
+            last_404 = (c, auth_host)
             continue
 
     if data is None or canonical is None:
         # All candidates 404'd. Report against the last attempt (typically
-        # the master fallback) with full forge auth context.
-        parsed = urllib.parse.urlparse(last_404 or candidates[-1])
-        sent_token = bool(_auth_headers_for(parsed))
+        # the master fallback) with full forge auth context, keyed on the
+        # *auth* host (so the hint references github.com, not a mirror).
+        last_url, last_auth_host = last_404 or candidates[-1]
+        auth_parsed = urllib.parse.urlparse(last_url)._replace(netloc=last_auth_host)
+        sent_token = bool(_auth_headers_for(auth_parsed))
+        attempted = [c for c, _ in candidates]
         raise SystemExit(
-            f"fetch failed: all candidate URLs 404'd: {candidates}\n"
-            f"{_auth_hint(parsed, sent_token=sent_token, status=404)}"
+            f"fetch failed: all candidate URLs 404'd: {attempted}\n"
+            f"{_auth_hint(auth_parsed, sent_token=sent_token, status=404)}"
         )
 
     parsed = urllib.parse.urlparse(canonical)
@@ -293,7 +332,8 @@ def _auth_hint(parsed: urllib.parse.ParseResult, *, sent_token: bool = False, st
     scope = "read_repository" if is_gitlab else ("repo" if is_github else "read")
 
     setup_lines = [
-        f"  cg config providers --set              # interactive, saves to ~/.config/cg",
+        f"  cg config providers add                # interactive, saves to ~/.config/cg",
+        f"  cg config providers add <provider> <domain> <token>   # non-interactive (CI)",
     ]
 
     if sent_token:
@@ -305,7 +345,7 @@ def _auth_hint(parsed: urllib.parse.ParseResult, *, sent_token: bool = False, st
         if forge:
             head += (
                 f" If you need to use a different token for this host, update it with "
-                f"`cg config providers --set`."
+                f"`cg config providers add`."
             )
         return head
     head = (

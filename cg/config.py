@@ -4,6 +4,13 @@ Stores provider credentials at `~/.config/cg/openapi_providers.json`
 (respects `XDG_CONFIG_HOME`). Schema:
 
     {
+      "mirrors": {
+        "http": {
+          "github.com":                "https://mynexus.example/repository/github-web",
+          "raw.githubusercontent.com": "https://mynexus.example/repository/github-raw",
+          "gitlab.com":                "https://mynexus.example/repository/gitlab-raw"
+        }
+      },
       "github": [
         {"domain": "github.com", "token": "ghp_..."}
       ],
@@ -13,8 +20,10 @@ Stores provider credentials at `~/.config/cg/openapi_providers.json`
       ]
     }
 
-Tokens stored in this file feed into `remote._token_for` so URL fetches
-pick them up automatically.
+Tokens feed into `remote._token_for` so URL fetches pick them up
+automatically. HTTP mirrors feed into `remote._apply_http_mirror` and
+rewrite outbound URLs from the configured host to the corresponding
+prefix while still authenticating against the original host's token.
 """
 
 from __future__ import annotations
@@ -27,6 +36,8 @@ from typing import Any
 
 
 PROVIDERS = ("github", "gitlab")
+MIRRORS_KEY = "mirrors"
+_KNOWN_MIRROR_PROTOCOLS = ("http",)
 
 
 def config_dir() -> Path:
@@ -40,8 +51,13 @@ def providers_path() -> Path:
     return config_dir() / "openapi_providers.json"
 
 
-def load_providers() -> dict[str, list[dict[str, str]]]:
-    """Read the providers file. Returns an empty dict if absent."""
+def load_providers() -> dict[str, Any]:
+    """Read the providers file. Returns an empty dict if absent.
+
+    Two known top-level shapes:
+      - `<provider>`: list of `{domain, token}` entries.
+      - `mirrors`: dict with optional `http: {host: prefix-url}`.
+    """
     path = providers_path()
     if not path.exists():
         return {}
@@ -52,8 +68,11 @@ def load_providers() -> dict[str, list[dict[str, str]]]:
         raise SystemExit(f"{path}: invalid JSON: {e}")
     if not isinstance(data, dict):
         raise SystemExit(f"{path}: top-level must be an object")
-    out: dict[str, list[dict[str, str]]] = {}
+    out: dict[str, Any] = {}
     for provider, entries in data.items():
+        if provider == MIRRORS_KEY:
+            out[provider] = _load_mirrors(entries, path)
+            continue
         if not isinstance(entries, list):
             raise SystemExit(f"{path}: {provider!r} must be a list")
         norm: list[dict[str, str]] = []
@@ -64,6 +83,38 @@ def load_providers() -> dict[str, list[dict[str, str]]]:
                 )
             norm.append({"domain": str(entry["domain"]), "token": str(entry["token"])})
         out[provider] = norm
+    return out
+
+
+def _load_mirrors(value: Any, path: Path) -> dict[str, dict[str, str]]:
+    """Validate and normalize the `mirrors` top-level block."""
+    from . import remote
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path}: 'mirrors' must be an object")
+    out: dict[str, dict[str, str]] = {}
+    for proto, hosts in value.items():
+        if proto not in _KNOWN_MIRROR_PROTOCOLS:
+            raise SystemExit(
+                f"{path}: 'mirrors.{proto}' is not a recognized protocol; "
+                f"expected one of: {', '.join(_KNOWN_MIRROR_PROTOCOLS)}"
+            )
+        if not isinstance(hosts, dict):
+            raise SystemExit(f"{path}: 'mirrors.{proto}' must be an object")
+        norm: dict[str, str] = {}
+        for host, prefix in hosts.items():
+            if not isinstance(prefix, str) or not remote.is_url(prefix):
+                raise SystemExit(
+                    f"{path}: 'mirrors.{proto}[{host!r}]' must be an http(s) URL string"
+                )
+            import urllib.parse
+            prefix_parsed = urllib.parse.urlparse(prefix)
+            if prefix_parsed.netloc == host:
+                raise SystemExit(
+                    f"{path}: 'mirrors.{proto}[{host!r}]' prefix host equals "
+                    f"original host (would loop)"
+                )
+            norm[str(host)] = prefix.rstrip("/")
+        out[proto] = norm
     return out
 
 
@@ -87,23 +138,42 @@ def save_providers(data: dict[str, list[dict[str, str]]]) -> Path:
 def token_for_domain(domain: str) -> str | None:
     """Return the configured token for `domain`, or None if none is set."""
     data = load_providers()
-    for entries in data.values():
+    for key, entries in data.items():
+        if key == MIRRORS_KEY:
+            continue
         for entry in entries:
             if entry["domain"] == domain:
                 return entry["token"]
     return None
 
 
+def http_mirror_for(host: str) -> str | None:
+    """Return the configured http mirror prefix for `host`, or None."""
+    data = load_providers()
+    mirrors = data.get(MIRRORS_KEY)
+    if not isinstance(mirrors, dict):
+        return None
+    http = mirrors.get("http")
+    if not isinstance(http, dict):
+        return None
+    prefix = http.get(host)
+    return prefix if isinstance(prefix, str) else None
+
+
 def _mask(token: str) -> str:
     return "*" * 8
 
 
-def render_masked(data: dict[str, list[dict[str, str]]]) -> str:
-    """Render the providers file with tokens replaced by `********`."""
+def render_masked(data: dict[str, Any]) -> str:
+    """Render the providers file with tokens replaced by `********`.
+    Mirror prefixes are shown unmasked (they're not secrets)."""
     masked: dict[str, Any] = {}
-    for provider, entries in data.items():
-        masked[provider] = [
-            {"domain": e["domain"], "token": _mask(e["token"])} for e in entries
+    for key, value in data.items():
+        if key == MIRRORS_KEY:
+            masked[key] = value
+            continue
+        masked[key] = [
+            {"domain": e["domain"], "token": _mask(e["token"])} for e in value
         ]
     return json.dumps(masked, indent=2) + "\n"
 
@@ -134,6 +204,10 @@ def _prompt(label: str, choices: tuple[str, ...] | None = None) -> str:
 def _upsert(provider: str, domain: str, token: str) -> tuple[Path, bool]:
     data = load_providers()
     entries = data.setdefault(provider, [])
+    if not isinstance(entries, list):
+        raise SystemExit(
+            f"{providers_path()}: {provider!r} must be a list, got {type(entries).__name__}"
+        )
     updated = False
     for entry in entries:
         if entry["domain"] == domain:
