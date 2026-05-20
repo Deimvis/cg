@@ -197,6 +197,9 @@ def _cache_dir() -> Path:
     return _CACHE_DIR
 
 
+_FETCH_TIMEOUT_S = 10
+
+
 class _NotFound(Exception):
     """Internal: fetch attempt got a 404 (used for ref-fallback in convenience URLs)."""
 
@@ -225,7 +228,7 @@ def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
 
     req = urllib.request.Request(request_url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT_S) as resp:
             data = resp.read()
             content_type = resp.headers.get("Content-Type", "")
             final_url = resp.geturl()
@@ -238,6 +241,11 @@ def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
                 f"{_auth_hint(auth_parsed, sent_token=sent_token, status=e.code)}"
             )
         raise SystemExit(f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.")
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise SystemExit(
+            f"fetch failed: {canonical} -> {type(e).__name__}: {e} "
+            f"(timeout {_FETCH_TIMEOUT_S}s)"
+        )
 
     basename = os.path.basename(parsed.path) or "remote.yaml"
     if "html" in content_type.lower() and basename.endswith(".yaml"):
