@@ -9,6 +9,12 @@ Stores provider credentials at `~/.config/cg/openapi_providers.json`
           "github.com":                "https://mynexus.example/repository/github-web",
           "raw.githubusercontent.com": "https://mynexus.example/repository/github-raw",
           "gitlab.com":                "https://mynexus.example/repository/gitlab-raw"
+        },
+        "custom": {
+          "github-raw-via-nexus": {
+            "match":   {"convertable": {"hostname": {"eq": "raw.githubusercontent.com"}}},
+            "rewrite": {"url": {"template": "https://mynexus.example/repository/github-raw{path}"}}
+          }
         }
       },
       "github": [
@@ -25,6 +31,15 @@ Tokens feed into `remote._token_for` so URL fetches pick them up
 automatically. HTTP mirrors feed into `remote._apply_http_mirror` and
 rewrite outbound URLs from the configured host to the corresponding
 prefix while still authenticating against the original host's token.
+
+`mirrors.custom` is a more expressive section. Each entry has a free-form
+unique name plus a `match` clause (exactly one of `exact` or `convertable`,
+checked against the URL's hostname pre- and post-normalize respectively)
+and a `rewrite.url.template` string using Python `str.format` placeholders
+drawn from {schema, hostname, port, path, query}. Custom rules win over
+the simple `http` map. The `convertable` form lets one rule catch both
+the convenience URL (e.g. `github.com/.../blob/main/x`) and its
+normalized raw form (`raw.githubusercontent.com/.../main/x`).
 
 `fetch_mode` (gitlab entries only) selects how `/-/raw/...` URLs are
 fetched: `"web"` keeps the plain URL, `"api"` rewrites it to
@@ -53,7 +68,9 @@ from typing import Any
 
 PROVIDERS = ("github", "gitlab")
 MIRRORS_KEY = "mirrors"
-_KNOWN_MIRROR_PROTOCOLS = ("http",)
+_KNOWN_MIRROR_PROTOCOLS = ("http", "custom")
+_MIRROR_TEMPLATE_VARS = ("schema", "hostname", "port", "path", "query")
+_MIRROR_MATCH_KINDS = ("exact", "convertable")
 IP_RESOLUTION_VALUES = ("any", "prefer/ipv4", "only/ipv4", "prefer/ipv6", "only/ipv6")
 
 
@@ -134,22 +151,25 @@ def load_providers() -> dict[str, Any]:
     return out
 
 
-def _load_mirrors(value: Any, path: Path) -> dict[str, dict[str, str]]:
+def _load_mirrors(value: Any, path: Path) -> dict[str, Any]:
     """Validate and normalize the `mirrors` top-level block."""
     from . import remote
     if not isinstance(value, dict):
         raise SystemExit(f"{path}: 'mirrors' must be an object")
-    out: dict[str, dict[str, str]] = {}
-    for proto, hosts in value.items():
+    out: dict[str, Any] = {}
+    for proto, body in value.items():
         if proto not in _KNOWN_MIRROR_PROTOCOLS:
             raise SystemExit(
                 f"{path}: 'mirrors.{proto}' is not a recognized protocol; "
                 f"expected one of: {', '.join(_KNOWN_MIRROR_PROTOCOLS)}"
             )
-        if not isinstance(hosts, dict):
+        if proto == "custom":
+            out[proto] = _load_custom_mirrors(body, path)
+            continue
+        if not isinstance(body, dict):
             raise SystemExit(f"{path}: 'mirrors.{proto}' must be an object")
         norm: dict[str, str] = {}
-        for host, prefix in hosts.items():
+        for host, prefix in body.items():
             if not isinstance(prefix, str) or not remote.is_url(prefix):
                 raise SystemExit(
                     f"{path}: 'mirrors.{proto}[{host!r}]' must be an http(s) URL string"
@@ -164,6 +184,120 @@ def _load_mirrors(value: Any, path: Path) -> dict[str, dict[str, str]]:
             norm[str(host)] = prefix.rstrip("/")
         out[proto] = norm
     return out
+
+
+def _load_custom_mirrors(value: Any, path: Path) -> list[dict[str, Any]]:
+    """Validate and normalize `mirrors.custom`. Returns a list of rules in
+    JSON declaration order: [{'name', 'match', 'rewrite'}, ...]."""
+    from . import remote
+    import urllib.parse
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path}: 'mirrors.custom' must be an object")
+    rules: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for name, rule in value.items():
+        loc = f"'mirrors.custom[{name!r}]'"
+        if name in seen_names:
+            raise SystemExit(f"{path}: {loc}: duplicate rule name")
+        seen_names.add(name)
+        if not isinstance(rule, dict):
+            raise SystemExit(f"{path}: {loc} must be an object")
+        extra = set(rule.keys()) - {"match", "rewrite"}
+        if extra:
+            raise SystemExit(
+                f"{path}: {loc}: unexpected keys {sorted(extra)}; allowed: match, rewrite"
+            )
+        if "match" not in rule or "rewrite" not in rule:
+            raise SystemExit(f"{path}: {loc}: must set both 'match' and 'rewrite'")
+        match = rule["match"]
+        if not isinstance(match, dict):
+            raise SystemExit(f"{path}: {loc}.match must be an object")
+        present = [k for k in _MIRROR_MATCH_KINDS if k in match]
+        unknown = set(match.keys()) - set(_MIRROR_MATCH_KINDS)
+        if unknown:
+            raise SystemExit(
+                f"{path}: {loc}.match: unexpected keys {sorted(unknown)}; "
+                f"allowed: {', '.join(_MIRROR_MATCH_KINDS)}"
+            )
+        if len(present) != 1:
+            raise SystemExit(
+                f"{path}: {loc}.match: must set exactly one of "
+                f"{', '.join(_MIRROR_MATCH_KINDS)}, got {present!r}"
+            )
+        kind = present[0]
+        spec = match[kind]
+        if not isinstance(spec, dict) or set(spec.keys()) != {"hostname"}:
+            raise SystemExit(
+                f"{path}: {loc}.match.{kind}: must be an object with a single 'hostname' key"
+            )
+        hostname_pred = spec["hostname"]
+        if (
+            not isinstance(hostname_pred, dict)
+            or set(hostname_pred.keys()) != {"eq"}
+            or not isinstance(hostname_pred.get("eq"), str)
+            or not hostname_pred["eq"]
+        ):
+            raise SystemExit(
+                f"{path}: {loc}.match.{kind}.hostname: must be {{'eq': <non-empty string>}}"
+            )
+        eq_value = hostname_pred["eq"]
+
+        rewrite = rule["rewrite"]
+        if not isinstance(rewrite, dict) or set(rewrite.keys()) != {"url"}:
+            raise SystemExit(
+                f"{path}: {loc}.rewrite: must be an object with a single 'url' key"
+            )
+        url_spec = rewrite["url"]
+        if not isinstance(url_spec, dict) or set(url_spec.keys()) != {"template"}:
+            raise SystemExit(
+                f"{path}: {loc}.rewrite.url: must be an object with a single 'template' key"
+            )
+        template = url_spec["template"]
+        if not isinstance(template, str) or not template:
+            raise SystemExit(
+                f"{path}: {loc}.rewrite.url.template: must be a non-empty string"
+            )
+        try:
+            sample = {v: "" for v in _MIRROR_TEMPLATE_VARS}
+            template.format_map(sample)
+        except KeyError as e:
+            raise SystemExit(
+                f"{path}: {loc}.rewrite.url.template: unknown placeholder {{{e.args[0]}}}; "
+                f"available: {', '.join(_MIRROR_TEMPLATE_VARS)}"
+            )
+        except (IndexError, ValueError) as e:
+            raise SystemExit(
+                f"{path}: {loc}.rewrite.url.template: invalid format string: {e}"
+            )
+
+        probe_vars = {
+            "schema":   "https",
+            "hostname": eq_value,
+            "port":     "",
+            "path":     "/probe",
+            "query":    "",
+        }
+        try:
+            probe = template.format_map(probe_vars)
+        except Exception as e:
+            raise SystemExit(
+                f"{path}: {loc}.rewrite.url.template: failed to expand: {e}"
+            )
+        if not remote.is_url(probe):
+            raise SystemExit(
+                f"{path}: {loc}.rewrite.url.template: must produce an http(s) URL when expanded, got {probe!r}"
+            )
+        if urllib.parse.urlparse(probe).netloc.split("@")[-1].split(":")[0] == eq_value:
+            raise SystemExit(
+                f"{path}: {loc}: rewrite host equals match hostname {eq_value!r} (would loop)"
+            )
+
+        rules.append({
+            "name": str(name),
+            "match": {kind: {"hostname": {"eq": eq_value}}},
+            "rewrite": {"url": {"template": template}},
+        })
+    return rules
 
 
 def save_providers(data: dict[str, list[dict[str, str]]]) -> Path:
@@ -237,6 +371,21 @@ def http_mirror_for(host: str) -> str | None:
         return None
     prefix = http.get(host)
     return prefix if isinstance(prefix, str) else None
+
+
+def custom_mirrors() -> list[dict[str, Any]]:
+    """Return configured custom mirror rules in declaration order.
+
+    Each item: {'name': str, 'match': {<kind>: {'hostname': {'eq': str}}},
+    'rewrite': {'url': {'template': str}}} where <kind> is 'exact' or
+    'convertable'.
+    """
+    data = load_providers()
+    mirrors = data.get(MIRRORS_KEY)
+    if not isinstance(mirrors, dict):
+        return []
+    rules = mirrors.get("custom")
+    return rules if isinstance(rules, list) else []
 
 
 def _mask(token: str) -> str:

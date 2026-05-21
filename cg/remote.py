@@ -143,17 +143,89 @@ def _apply_http_mirror(url: str) -> tuple[str, str]:
     return new_url, parsed.netloc
 
 
+def _template_vars(parsed: urllib.parse.ParseResult) -> dict[str, str]:
+    """Variable map for `mirrors.custom` rewrite templates.
+
+    Names match the user-facing schema verbatim — `schema` (not `scheme`)
+    and `hostname` (not `host`).
+    """
+    return {
+        "schema":   parsed.scheme,
+        "hostname": parsed.hostname or "",
+        "port":     str(parsed.port) if parsed.port else "",
+        "path":     parsed.path,
+        "query":    parsed.query,
+    }
+
+
+def _apply_custom_mirror(url: str, normalized: str) -> tuple[str, str] | None:
+    """Try every `mirrors.custom` rule in declaration order.
+
+    Returns `(rewritten_url, auth_host)` on first match, or None.
+    `auth_host` is the *original* URL's netloc, so token lookups continue
+    to key off the source forge. For `convertable` rules, template vars
+    come from the normalized URL (post `normalize_url`); for `exact`
+    rules, from `url` as-is.
+    """
+    from . import config
+    rules = config.custom_mirrors()
+    if not rules:
+        return None
+    parsed_input = urllib.parse.urlparse(url)
+    parsed_norm = urllib.parse.urlparse(normalized)
+    auth_host = parsed_input.netloc
+    for rule in rules:
+        match = rule["match"]
+        if "exact" in match:
+            eq = match["exact"]["hostname"]["eq"]
+            if (parsed_input.hostname or "") != eq:
+                continue
+            vars_src = parsed_input
+        else:
+            eq = match["convertable"]["hostname"]["eq"]
+            if (parsed_norm.hostname or "") != eq:
+                continue
+            vars_src = parsed_norm
+        template = rule["rewrite"]["url"]["template"]
+        try:
+            rewritten = template.format_map(_template_vars(vars_src))
+        except (KeyError, IndexError, ValueError) as e:
+            raise SystemExit(
+                f"mirrors.custom[{rule['name']!r}]: template expansion failed for "
+                f"{url!r}: {e}"
+            )
+        return rewritten, auth_host
+    return None
+
+
 def _candidate_canonical_urls(url: str) -> list[tuple[str, str]]:
     """Return the URL(s) to try fetching for `url`, in order, paired with
     the *auth host* to use for each. For convenience-form forge URLs (no
-    explicit ref), returns `[main-form, master-form]` candidates."""
-    rewritten, auth_host = _apply_http_mirror(url)
-    canonical = normalize_url(rewritten)
+    explicit ref), returns `[main-form, master-form]` candidates.
+
+    Routing order: `mirrors.custom` rules are evaluated first (against the
+    pre- and post-normalize URL depending on the rule kind). If none match,
+    fall back to the historical `mirrors.http` lookup applied to the input
+    URL before normalization.
+    """
+    normalized = normalize_url(url)
+    custom = _apply_custom_mirror(url, normalized)
+    if custom is not None:
+        canonical, auth_host = custom
+    else:
+        rewritten, auth_host = _apply_http_mirror(url)
+        canonical = normalize_url(rewritten)
     if not _is_convenience_form(url):
         return [(canonical, auth_host)]
     out: list[tuple[str, str]] = [(canonical, auth_host)]
     for ref in _DEFAULT_BRANCHES[1:]:
-        alt = normalize_url(rewritten, default_ref=ref)
+        if custom is not None:
+            alt_norm = normalize_url(url, default_ref=ref)
+            alt_match = _apply_custom_mirror(url, alt_norm)
+            alt = alt_match[0] if alt_match is not None else alt_norm
+        else:
+            rewritten_alt, _ = _apply_http_mirror(url)
+            alt = normalize_url(rewritten_alt, default_ref=ref)
         if alt != canonical and not any(alt == c for c, _ in out):
             out.append((alt, auth_host))
     return out
