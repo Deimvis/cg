@@ -602,11 +602,11 @@ def _resolve_ref_target(openapi_fp: Path, ref_target: str) -> Path:
     if ref_target == '':
         return openapi_fp
     if remote.is_url(ref_target):
-        return remote.fetch(ref_target)
+        return remote.fetch(ref_target, source=openapi_fp)
     source_url = remote.url_of_cache_path(openapi_fp)
     if source_url is not None:
         joined = urllib.parse.urljoin(source_url, ref_target)
-        return remote.fetch(joined)
+        return remote.fetch(joined, source=openapi_fp)
     return (openapi_fp.parent / ref_target).resolve()
 
 

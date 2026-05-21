@@ -277,7 +277,19 @@ class _NotFound(Exception):
     """Internal: fetch attempt got a 404 (used for ref-fallback in convenience URLs)."""
 
 
-def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
+def _format_source(source: str | Path | None) -> str | None:
+    """Render a source location for error messages. If `source` is a cached
+    remote path, replace it with the original URL so users see something
+    they can actually open."""
+    if source is None:
+        return None
+    if isinstance(source, Path):
+        url = url_of_cache_path(source)
+        return url if url is not None else str(source)
+    return str(source)
+
+
+def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = None) -> tuple[bytes, str]:
     """Single fetch of `canonical`. Returns `(data, content_type)`. Raises
     `_NotFound` on 404, or `SystemExit` for non-recoverable failures.
 
@@ -319,9 +331,23 @@ def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
             )
         raise SystemExit(f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.")
     except (urllib.error.URLError, TimeoutError) as e:
+        reason = getattr(e, "reason", e)
+        is_timeout = isinstance(e, TimeoutError) or isinstance(reason, TimeoutError)
+        lines = []
+        ref_from = _format_source(source)
+        if ref_from is not None:
+            lines.append(f"  ref from:  {ref_from}")
+        lines.append(f"  ref to:    {canonical}")
+        if request_url != canonical:
+            lines.append(f"  requested: {request_url}")
+        lines.append(f"  host:      {connect_host}")
+        details = "\n".join(lines)
+        if is_timeout:
+            raise SystemExit(
+                f"fetch timed out after {_FETCH_TIMEOUT_S}s\n{details}"
+            )
         raise SystemExit(
-            f"fetch failed: {canonical} -> {type(e).__name__}: {e} "
-            f"(timeout {_FETCH_TIMEOUT_S}s)"
+            f"fetch failed: {type(e).__name__}: {reason}\n{details}"
         )
 
     basename = os.path.basename(parsed.path) or "remote.yaml"
@@ -334,7 +360,7 @@ def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
     return data, content_type
 
 
-def fetch(url: str) -> Path:
+def fetch(url: str, source: str | Path | None = None) -> Path:
     """Download `url` (after normalization) into the cache and return the local path.
 
     Subsequent calls for the same URL return the cached path without re-downloading.
@@ -342,6 +368,10 @@ def fetch(url: str) -> Path:
     first and falls back to `master` on 404. The cache file name preserves
     the original `.yaml` suffix so downstream assertions on `Path.suffix`
     keep working.
+
+    `source`, when given, is the file/URL that referenced `url` (e.g. the
+    openapi spec containing a `$ref`); it's surfaced in fetch error
+    messages so users can locate the bad reference.
     """
     candidates = _candidate_canonical_urls(url)
     # Reuse the cache via any of the candidate canonical URLs.
@@ -354,7 +384,7 @@ def fetch(url: str) -> Path:
     canonical: str | None = None
     for c, auth_host in candidates:
         try:
-            data, _ = _attempt_fetch(c, auth_host)
+            data, _ = _attempt_fetch(c, auth_host, source=source)
             canonical = c
             break
         except _NotFound:
@@ -369,8 +399,10 @@ def fetch(url: str) -> Path:
         auth_parsed = urllib.parse.urlparse(last_url)._replace(netloc=last_auth_host)
         sent_token = bool(_auth_headers_for(auth_parsed))
         attempted = [c for c, _ in candidates]
+        ref_from = _format_source(source)
+        ref_line = f"\n  ref from: {ref_from}" if ref_from else ""
         raise SystemExit(
-            f"fetch failed: all candidate URLs 404'd: {attempted}\n"
+            f"fetch failed: all candidate URLs 404'd: {attempted}{ref_line}\n"
             f"{_auth_hint(auth_parsed, sent_token=sent_token, status=404)}"
         )
 
