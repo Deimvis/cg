@@ -16,7 +16,8 @@ Stores provider credentials at `~/.config/cg/openapi_providers.json`
       ],
       "gitlab": [
         {"domain": "gitlab.com", "token": "glpat-..."},
-        {"domain": "gitlab.corp.example", "token": "glpat-..."}
+        {"domain": "gitlab.corp.example", "token": "glpat-...", "fetch_mode": "web"},
+        {"domain": "gitlab.public.example", "fetch_mode": "web"}
       ]
     }
 
@@ -24,6 +25,13 @@ Tokens feed into `remote._token_for` so URL fetches pick them up
 automatically. HTTP mirrors feed into `remote._apply_http_mirror` and
 rewrite outbound URLs from the configured host to the corresponding
 prefix while still authenticating against the original host's token.
+
+`fetch_mode` (gitlab entries only) selects how `/-/raw/...` URLs are
+fetched: `"web"` keeps the plain URL, `"api"` rewrites it to
+`/api/v4/projects/.../repository/files/.../raw?ref=...`. When unset,
+the default is `"api"` for entries with a token (preserves historical
+behavior) and `"web"` otherwise. `token` is optional when `fetch_mode`
+is set.
 """
 
 from __future__ import annotations
@@ -77,11 +85,29 @@ def load_providers() -> dict[str, Any]:
             raise SystemExit(f"{path}: {provider!r} must be a list")
         norm: list[dict[str, str]] = []
         for i, entry in enumerate(entries):
-            if not isinstance(entry, dict) or "domain" not in entry or "token" not in entry:
+            if not isinstance(entry, dict) or "domain" not in entry:
                 raise SystemExit(
-                    f"{path}: {provider!r}[{i}] must be an object with 'domain' and 'token'"
+                    f"{path}: {provider!r}[{i}] must be an object with 'domain'"
                 )
-            norm.append({"domain": str(entry["domain"]), "token": str(entry["token"])})
+            norm_entry: dict[str, str] = {"domain": str(entry["domain"])}
+            if "token" in entry:
+                norm_entry["token"] = str(entry["token"])
+            if provider == "gitlab" and "fetch_mode" in entry:
+                mode = entry["fetch_mode"]
+                if mode not in ("web", "api"):
+                    raise SystemExit(
+                        f"{path}: {provider!r}[{i}].fetch_mode must be 'web' or 'api', got {mode!r}"
+                    )
+                norm_entry["fetch_mode"] = mode
+            if "token" not in norm_entry and "fetch_mode" not in norm_entry:
+                raise SystemExit(
+                    f"{path}: {provider!r}[{i}] must set at least 'token' or 'fetch_mode'"
+                )
+            if provider != "gitlab" and "token" not in norm_entry:
+                raise SystemExit(
+                    f"{path}: {provider!r}[{i}] must set 'token'"
+                )
+            norm.append(norm_entry)
         out[provider] = norm
     return out
 
@@ -143,8 +169,23 @@ def token_for_domain(domain: str) -> str | None:
             continue
         for entry in entries:
             if entry["domain"] == domain:
-                return entry["token"]
+                return entry.get("token")
     return None
+
+
+def gitlab_fetch_mode(domain: str) -> str:
+    """Return 'web' or 'api' for a gitlab domain.
+
+    Defaults: 'api' if the entry has a token (preserves historical behavior),
+    'web' otherwise (no entry, or entry without a token).
+    """
+    data = load_providers()
+    for entry in data.get("gitlab", []):
+        if entry["domain"] == domain:
+            if "fetch_mode" in entry:
+                return entry["fetch_mode"]
+            return "api" if "token" in entry else "web"
+    return "web"
 
 
 def http_mirror_for(host: str) -> str | None:
@@ -172,9 +213,13 @@ def render_masked(data: dict[str, Any]) -> str:
         if key == MIRRORS_KEY:
             masked[key] = value
             continue
-        masked[key] = [
-            {"domain": e["domain"], "token": _mask(e["token"])} for e in value
-        ]
+        entries = []
+        for e in value:
+            me = dict(e)
+            if "token" in me:
+                me["token"] = _mask(me["token"])
+            entries.append(me)
+        masked[key] = entries
     return json.dumps(masked, indent=2) + "\n"
 
 

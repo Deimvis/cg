@@ -221,10 +221,12 @@ def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
         headers[header_name] = value
 
     request_url = canonical
-    if sent_token and auth_host == parsed.netloc and _looks_like_gitlab(parsed):
-        api_url = _gitlab_api_url(canonical)
-        if api_url is not None:
-            request_url = api_url
+    if auth_host == parsed.netloc and _looks_like_gitlab(parsed):
+        from . import config
+        if config.gitlab_fetch_mode(auth_host) == "api":
+            api_url = _gitlab_api_url(canonical)
+            if api_url is not None:
+                request_url = api_url
 
     req = urllib.request.Request(request_url, headers=headers)
     try:
