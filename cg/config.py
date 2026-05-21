@@ -32,6 +32,14 @@ fetched: `"web"` keeps the plain URL, `"api"` rewrites it to
 the default is `"api"` for entries with a token (preserves historical
 behavior) and `"web"` otherwise. `token` is optional when `fetch_mode`
 is set.
+
+`ip_resolution` (any provider) pins how DNS results for the entry's
+domain are filtered when opening the outbound TCP connection. One of:
+`"any"` (default — no filtering), `"prefer/ipv4"`, `"only/ipv4"`,
+`"prefer/ipv6"`, `"only/ipv6"`. The lookup is keyed on the *actual
+request host* (post-mirror, post-gitlab-API rewrite), so a mirror
+host can be pinned independently of the original forge host. `token`
+and `fetch_mode` are optional when `ip_resolution` is set.
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ from typing import Any
 PROVIDERS = ("github", "gitlab")
 MIRRORS_KEY = "mirrors"
 _KNOWN_MIRROR_PROTOCOLS = ("http",)
+IP_RESOLUTION_VALUES = ("any", "prefer/ipv4", "only/ipv4", "prefer/ipv6", "only/ipv6")
 
 
 def config_dir() -> Path:
@@ -99,11 +108,24 @@ def load_providers() -> dict[str, Any]:
                         f"{path}: {provider!r}[{i}].fetch_mode must be 'web' or 'api', got {mode!r}"
                     )
                 norm_entry["fetch_mode"] = mode
-            if "token" not in norm_entry and "fetch_mode" not in norm_entry:
+            if "ip_resolution" in entry:
+                ipr = entry["ip_resolution"]
+                if ipr not in IP_RESOLUTION_VALUES:
+                    raise SystemExit(
+                        f"{path}: {provider!r}[{i}].ip_resolution must be one of "
+                        f"{', '.join(IP_RESOLUTION_VALUES)}, got {ipr!r}"
+                    )
+                norm_entry["ip_resolution"] = ipr
+            if (
+                "token" not in norm_entry
+                and "fetch_mode" not in norm_entry
+                and "ip_resolution" not in norm_entry
+            ):
                 raise SystemExit(
-                    f"{path}: {provider!r}[{i}] must set at least 'token' or 'fetch_mode'"
+                    f"{path}: {provider!r}[{i}] must set at least one of "
+                    f"'token', 'fetch_mode', 'ip_resolution'"
                 )
-            if provider != "gitlab" and "token" not in norm_entry:
+            if provider != "gitlab" and "token" not in norm_entry and "ip_resolution" not in norm_entry:
                 raise SystemExit(
                     f"{path}: {provider!r}[{i}] must set 'token'"
                 )
@@ -186,6 +208,22 @@ def gitlab_fetch_mode(domain: str) -> str:
                 return entry["fetch_mode"]
             return "api" if "token" in entry else "web"
     return "web"
+
+
+def ip_resolution_for_domain(domain: str) -> str:
+    """Return the configured ip_resolution for `domain`, or 'any' if unset.
+
+    Scans all provider entries (github, gitlab, ...); the flag is a
+    network-layer concern that applies regardless of provider.
+    """
+    data = load_providers()
+    for key, entries in data.items():
+        if key == MIRRORS_KEY:
+            continue
+        for entry in entries:
+            if entry["domain"] == domain:
+                return entry.get("ip_resolution", "any")
+    return "any"
 
 
 def http_mirror_for(host: str) -> str | None:

@@ -10,7 +10,9 @@ and header generation reason about the original URL when needed.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import os
+import socket
 import tempfile
 import urllib.error
 import urllib.parse
@@ -200,6 +202,77 @@ def _cache_dir() -> Path:
 _FETCH_TIMEOUT_S = 10
 
 
+def _dial(host: str, port: int, mode: str, timeout):
+    """Open a TCP socket to (host, port), honoring an `ip_resolution` mode.
+
+    Modes: 'any' (default — delegates to socket.create_connection),
+    'prefer/ipv4'|'prefer/ipv6' (try preferred family first, fall back),
+    'only/ipv4'|'only/ipv6' (refuse to connect over the other family).
+    """
+    if mode == "any":
+        return socket.create_connection((host, port), timeout=timeout)
+    family_pref = socket.AF_INET if "ipv4" in mode else socket.AF_INET6
+    only = mode.startswith("only/")
+    infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    if only:
+        infos = [i for i in infos if i[0] == family_pref]
+        if not infos:
+            label = "IPv4" if family_pref == socket.AF_INET else "IPv6"
+            raise OSError(
+                f"no {label} address for {host!r} (ip_resolution={mode!r})"
+            )
+    else:
+        infos.sort(key=lambda i: 0 if i[0] == family_pref else 1)
+    last_err: OSError | None = None
+    for fam, kind, proto, _canon, sa in infos:
+        s = socket.socket(fam, kind, proto)
+        try:
+            s.settimeout(timeout)
+            s.connect(sa)
+            return s
+        except OSError as e:
+            last_err = e
+            s.close()
+    raise last_err or OSError(f"could not connect to {host}:{port}")
+
+
+def _make_connection_cls(base, mode: str):
+    class _IPFilteredConnection(base):
+        def connect(self):
+            self.sock = _dial(self.host, self.port, mode, self.timeout)
+            tunnel_host = getattr(self, "_tunnel_host", None)
+            if tunnel_host:
+                self._tunnel()
+            ctx = getattr(self, "_context", None)
+            if ctx is not None:
+                self.sock = ctx.wrap_socket(
+                    self.sock, server_hostname=tunnel_host or self.host
+                )
+    return _IPFilteredConnection
+
+
+def _opener_for_mode(mode: str) -> urllib.request.OpenerDirector:
+    """Return an opener that enforces the given `ip_resolution` mode.
+
+    For `mode == "any"` returns the stock default opener so the
+    historical request path is preserved exactly.
+    """
+    if mode == "any":
+        return urllib.request.build_opener()
+    http_cls = _make_connection_cls(http.client.HTTPConnection, mode)
+    https_cls = _make_connection_cls(http.client.HTTPSConnection, mode)
+
+    class _H(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(http_cls, req)
+
+    class _HS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(https_cls, req)
+
+    return urllib.request.build_opener(_H(), _HS())
+
+
 class _NotFound(Exception):
     """Internal: fetch attempt got a 404 (used for ref-fallback in convenience URLs)."""
 
@@ -220,17 +293,19 @@ def _attempt_fetch(canonical: str, auth_host: str) -> tuple[bytes, str]:
     for header_name, value in auth_headers.items():
         headers[header_name] = value
 
+    from . import config
     request_url = canonical
     if auth_host == parsed.netloc and _looks_like_gitlab(parsed):
-        from . import config
         if config.gitlab_fetch_mode(auth_host) == "api":
             api_url = _gitlab_api_url(canonical)
             if api_url is not None:
                 request_url = api_url
 
     req = urllib.request.Request(request_url, headers=headers)
+    connect_host = urllib.parse.urlparse(request_url).netloc
+    opener = _opener_for_mode(config.ip_resolution_for_domain(connect_host))
     try:
-        with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT_S) as resp:
+        with opener.open(req, timeout=_FETCH_TIMEOUT_S) as resp:
             data = resp.read()
             content_type = resp.headers.get("Content-Type", "")
             final_url = resp.geturl()
