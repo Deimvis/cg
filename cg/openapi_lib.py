@@ -630,11 +630,6 @@ def _ref_go_package_name(openapi_fp: Path, ref_fp: Path) -> str | None:
     For ordinary volumes, the package is the parent dir name of the output
     file. For `dst="-"` (no output), the package comes from
     `imports.golang` — not yet implemented, so this errors out."""
-    # The same-parent shortcut only applies when both files are local. Remote
-    # caches all share a flat tempdir so their `parent` would collide.
-    if not remote.is_cache_path(openapi_fp) and not remote.is_cache_path(ref_fp):
-        if openapi_fp.resolve().parent == ref_fp.resolve().parent:
-            return None
     rel_source, vol = resolve_volume(ref_fp)
     if vol.dst is None:
         imports_lang = vol.imports.get('golang') if isinstance(vol.imports, dict) else None
@@ -648,6 +643,16 @@ def _ref_go_package_name(openapi_fp: Path, ref_fp: Path) -> str | None:
             f'$ref to {ref_fp}: default_volume.imports.golang rules are not yet supported'
         )
     out_dir = _resolved_output_dir(rel_source, vol)
+    # Same-package shortcut: when the referencing file resolves to the same
+    # output dir as the referenced one, no qualifier is needed. This handles
+    # both local files (sharing a real parent) and remote-cached files (which
+    # share a flat tempdir but still resolve to the same target package via
+    # their volume mapping).
+    src_rel_source, src_vol = resolve_volume(openapi_fp)
+    if src_vol.dst is not None:
+        src_out_dir = _resolved_output_dir(src_rel_source, src_vol)
+        if src_out_dir is not None and src_out_dir == out_dir:
+            return None
     return out_dir.name
 
 
