@@ -14,6 +14,7 @@ import http.client
 import os
 import socket
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -272,6 +273,8 @@ def _cache_dir() -> Path:
 
 
 _FETCH_TIMEOUT_S = 10
+_FETCH_MAX_ATTEMPTS = 3
+_FETCH_RETRY_BACKOFF_S = (0.5, 1.5)
 
 
 def _dial(host: str, port: int, mode: str, timeout):
@@ -388,39 +391,48 @@ def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = N
     req = urllib.request.Request(request_url, headers=headers)
     connect_host = urllib.parse.urlparse(request_url).netloc
     opener = _opener_for_mode(config.ip_resolution_for_domain(connect_host))
-    try:
-        with opener.open(req, timeout=_FETCH_TIMEOUT_S) as resp:
-            data = resp.read()
-            content_type = resp.headers.get("Content-Type", "")
-            final_url = resp.geturl()
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise _NotFound()
-        if e.code in (401, 403):
-            raise SystemExit(
-                f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.\n"
-                f"{_auth_hint(auth_parsed, sent_token=sent_token, status=e.code)}"
-            )
-        raise SystemExit(f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.")
-    except (urllib.error.URLError, TimeoutError) as e:
-        reason = getattr(e, "reason", e)
-        is_timeout = isinstance(e, TimeoutError) or isinstance(reason, TimeoutError)
-        lines = []
-        ref_from = _format_source(source)
-        if ref_from is not None:
-            lines.append(f"  ref from:  {ref_from}")
-        lines.append(f"  ref to:    {canonical}")
-        if request_url != canonical:
-            lines.append(f"  requested: {request_url}")
-        lines.append(f"  host:      {connect_host}")
-        details = "\n".join(lines)
-        if is_timeout:
-            raise SystemExit(
-                f"fetch timed out after {_FETCH_TIMEOUT_S}s\n{details}"
-            )
-        raise SystemExit(
-            f"fetch failed: {type(e).__name__}: {reason}\n{details}"
-        )
+    data: bytes = b""
+    content_type = ""
+    final_url = request_url
+    for attempt in range(_FETCH_MAX_ATTEMPTS):
+        try:
+            with opener.open(req, timeout=_FETCH_TIMEOUT_S) as resp:
+                data = resp.read()
+                content_type = resp.headers.get("Content-Type", "")
+                final_url = resp.geturl()
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise _NotFound()
+            if e.code in (401, 403):
+                raise SystemExit(
+                    f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.\n"
+                    f"{_auth_hint(auth_parsed, sent_token=sent_token, status=e.code)}"
+                )
+            raise SystemExit(f"fetch failed: {canonical} -> HTTP {e.code} {e.reason}.")
+        except (urllib.error.URLError, TimeoutError) as e:
+            reason = getattr(e, "reason", e)
+            is_timeout = isinstance(e, TimeoutError) or isinstance(reason, TimeoutError)
+            if is_timeout or attempt == _FETCH_MAX_ATTEMPTS - 1:
+                lines = []
+                ref_from = _format_source(source)
+                if ref_from is not None:
+                    lines.append(f"  ref from:  {ref_from}")
+                lines.append(f"  ref to:    {canonical}")
+                if request_url != canonical:
+                    lines.append(f"  requested: {request_url}")
+                lines.append(f"  host:      {connect_host}")
+                if not is_timeout and attempt > 0:
+                    lines.append(f"  attempts:  {attempt + 1}")
+                details = "\n".join(lines)
+                if is_timeout:
+                    raise SystemExit(
+                        f"fetch timed out after {_FETCH_TIMEOUT_S}s\n{details}"
+                    )
+                raise SystemExit(
+                    f"fetch failed: {type(e).__name__}: {reason}\n{details}"
+                )
+            time.sleep(_FETCH_RETRY_BACKOFF_S[attempt])
 
     basename = os.path.basename(parsed.path) or "remote.yaml"
     if "html" in content_type.lower() and basename.endswith(".yaml"):
