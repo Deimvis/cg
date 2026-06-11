@@ -1,4 +1,7 @@
 import argparse
+import copy
+import json
+import tempfile
 from pathlib import Path
 
 import sys
@@ -279,6 +282,30 @@ def _resolve_impl(args: argparse.Namespace) -> None:
         )
 
 
+def _add_defaults_patch_args(p: argparse.ArgumentParser) -> None:
+    """Register the `defaults patch` flag/positional set on `p`. Shared
+    between the persistent `cg config defaults patch` subparser and the
+    transient `cg with config defaults patch ...` head parser."""
+    p.add_argument(
+        "-t", "--type",
+        dest="patch_type",
+        choices=config.PATCH_TYPES,
+        default="kv",
+        help=(
+            "how to interpret positional inputs (kv = <dotted.path>=<value>, "
+            "patch-file = path to patch file [not yet implemented])"
+        ),
+    )
+    p.add_argument(
+        "inputs",
+        nargs="+",
+        help=(
+            "for -t kv: dotted-path assignments (cache.enabled=true, "
+            "cache.ttl={d:14}); for -t patch-file: paths to patch files"
+        ),
+    )
+
+
 def _run_config(argv: list[str]) -> int:
     """`cg config <topic> [action] [args]` — manage persistent configuration."""
     parser = argparse.ArgumentParser(prog="cg config", description="manage cg configuration")
@@ -312,24 +339,7 @@ def _run_config(argv: list[str]) -> int:
         "patch",
         help="apply updates to defaults config",
     )
-    patch.add_argument(
-        "-t", "--type",
-        dest="patch_type",
-        choices=config.PATCH_TYPES,
-        default="kv",
-        help=(
-            "how to interpret positional inputs (kv = <dotted.path>=<value>, "
-            "patch-file = path to patch file [not yet implemented])"
-        ),
-    )
-    patch.add_argument(
-        "inputs",
-        nargs="+",
-        help=(
-            "for -t kv: dotted-path assignments (cache.enabled=true, "
-            "cache.ttl={d:14}); for -t patch-file: paths to patch files"
-        ),
-    )
+    _add_defaults_patch_args(patch)
 
     args = parser.parse_args(argv)
     if args.topic == "providers":
@@ -351,10 +361,92 @@ def _run_config(argv: list[str]) -> int:
     return 2
 
 
-def main(argv: list[str] | None = None) -> None:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] == "config":
-        sys.exit(_run_config(argv[1:]))
+def _split_on_double_dash(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Return (head, tail) split at the first top-level `--`. If none is
+    present, head=argv and tail=[]."""
+    for i, a in enumerate(argv):
+        if a == "--":
+            return argv[:i], argv[i + 1:]
+    return list(argv), []
+
+
+def _apply_with_head(head: list[str], current: dict) -> dict:
+    """Run the mutation specified by `head` against `current` and return the
+    new data. `head` is the slice after the leading `config` token, e.g.
+    `["defaults", "patch", "cache.enabled=true"]`."""
+    if not head:
+        raise SystemExit("cg with: empty config mutation spec")
+    if head[0] != "defaults":
+        raise SystemExit(
+            f"cg with: only `config defaults ...` mutations are supported, "
+            f"got config {head[0]!r}"
+        )
+    if len(head) < 2:
+        raise SystemExit(
+            "cg with config defaults: missing action; expected one of: "
+            "patch, init, reset"
+        )
+    action = head[1]
+    if action in ("init", "reset"):
+        if len(head) > 2:
+            raise SystemExit(
+                f"cg with config defaults {action}: takes no arguments, "
+                f"got {head[2:]!r}"
+            )
+        return copy.deepcopy(config.SYSTEM_DEFAULTS)
+    if action == "patch":
+        p = argparse.ArgumentParser(
+            prog="cg with config defaults patch", add_help=False,
+        )
+        _add_defaults_patch_args(p)
+        parsed = p.parse_args(head[2:])
+        return config.apply_patch_inputs(current, parsed.patch_type, parsed.inputs)
+    raise SystemExit(
+        f"cg with config defaults: unsupported action {action!r}; "
+        f"expected one of: patch, init, reset"
+    )
+
+
+def _run_with(argv: list[str]) -> int:
+    """`cg with <config-mutation> -- <next>` — apply a transient defaults
+    patch for the duration of `<next>`. Stacks: `<next>` may itself begin
+    with `with`."""
+    head, tail = _split_on_double_dash(argv)
+    if not head:
+        raise SystemExit("cg with: missing mutation spec before '--'")
+    if not tail:
+        raise SystemExit(
+            "cg with: missing '--' separator and inner command after the "
+            "mutation spec"
+        )
+    if head[0] != "config":
+        raise SystemExit(
+            f"cg with: head must start with `config`, got {head[0]!r}"
+        )
+
+    current_data = config.load_defaults()
+    patched_data = _apply_with_head(head[1:], current_data)
+    config._validate_defaults(patched_data, config.defaults_path())
+
+    with tempfile.TemporaryDirectory(prefix="cg-with-") as tmpdir:
+        tmp_path = Path(tmpdir) / "defaults.json"
+        with tmp_path.open("w") as f:
+            json.dump(patched_data, f, indent=2)
+            f.write("\n")
+        prev = config.set_defaults_path_override(tmp_path)
+        try:
+            return _dispatch(tail)
+        finally:
+            config.set_defaults_path_override(prev)
+
+
+def _dispatch(argv: list[str]) -> int:
+    if not argv:
+        raise SystemExit("cg: empty command")
+    if argv[0] == "with":
+        return _run_with(argv[1:])
+    if argv[0] == "config":
+        return _run_config(argv[1:])
     args = _build_parser().parse_args(argv)
     _resolve_impl(args)
     openapi_lib.OUTPUT_TYPE = args.dst_type
@@ -364,6 +456,12 @@ def main(argv: list[str] | None = None) -> None:
         _run_sql(args)
     else:
         raise SystemExit(f"unsupported --src-type: {args.src_type}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    sys.exit(_dispatch(argv))
 
 
 if __name__ == "__main__":

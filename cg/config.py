@@ -325,8 +325,23 @@ SYSTEM_DEFAULTS: dict[str, Any] = {
 
 _DURATION_KEYS = ("d", "h", "m", "s", "ms", "mcs", "ns")
 
+_defaults_path_override: Path | None = None
+
+
+def set_defaults_path_override(p: Path | None) -> Path | None:
+    """Redirect `defaults_path()` to `p` for the rest of this process. Returns
+    the previous override so callers can restore it in a `finally`. Only the
+    transient `cg with` machinery should touch this — persistent commands
+    must keep targeting the real on-disk file."""
+    global _defaults_path_override
+    prev = _defaults_path_override
+    _defaults_path_override = p
+    return prev
+
 
 def defaults_path() -> Path:
+    if _defaults_path_override is not None:
+        return _defaults_path_override
     return config_dir() / DEFAULTS_FILENAME
 
 
@@ -755,7 +770,12 @@ def cmd_defaults_reset() -> int:
     return 0
 
 
-def cmd_defaults_patch(patch_type: str, inputs: list[str]) -> int:
+def apply_patch_inputs(
+    current: dict[str, Any], patch_type: str, inputs: list[str]
+) -> dict[str, Any]:
+    """Apply `cg config defaults patch` semantics to `current` and return the
+    new data. Pure: does not read or write the filesystem. Validates inputs
+    and (in patch-file mode) errors out cleanly."""
     if patch_type == "patch-file":
         raise SystemExit(
             "cg config defaults patch -t patch-file: not yet implemented"
@@ -770,10 +790,15 @@ def cmd_defaults_patch(patch_type: str, inputs: list[str]) -> int:
             "cg config defaults patch: at least one <dotted.path>=<value> "
             "argument required"
         )
-    merged = _deep_merge({}, load_defaults())
+    merged = _deep_merge({}, current)
     for raw in inputs:
         path_parts, value = _parse_kv_arg(raw)
         _patch_set(merged, path_parts, value)
+    return merged
+
+
+def cmd_defaults_patch(patch_type: str, inputs: list[str]) -> int:
+    merged = apply_patch_inputs(load_defaults(), patch_type, inputs)
     _validate_defaults(merged, defaults_path())
     out_path = save_defaults(merged)
     print(f"patched {out_path}")
