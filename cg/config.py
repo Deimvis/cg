@@ -325,23 +325,19 @@ SYSTEM_DEFAULTS: dict[str, Any] = {
 
 _DURATION_KEYS = ("d", "h", "m", "s", "ms", "mcs", "ns")
 
-_defaults_path_override: Path | None = None
-
-
-def set_defaults_path_override(p: Path | None) -> Path | None:
-    """Redirect `defaults_path()` to `p` for the rest of this process. Returns
-    the previous override so callers can restore it in a `finally`. Only the
-    transient `cg with` machinery should touch this — persistent commands
-    must keep targeting the real on-disk file."""
-    global _defaults_path_override
-    prev = _defaults_path_override
-    _defaults_path_override = p
-    return prev
+DEFAULTS_CONFIG_ENV = "CG_DEFAULTS_CONFIG"
 
 
 def defaults_path() -> Path:
-    if _defaults_path_override is not None:
-        return _defaults_path_override
+    """Where `cg` reads its defaults config from. Precedence:
+      1. `CG_DEFAULTS_CONFIG` env var — set by `cg with ... -- <cmd>` on
+         the child so any nested `cg` invocations under `<cmd>` see the
+         patched config,
+      2. `<config_dir()>/defaults.json`.
+    """
+    env_path = os.environ.get(DEFAULTS_CONFIG_ENV)
+    if env_path:
+        return Path(env_path)
     return config_dir() / DEFAULTS_FILENAME
 
 

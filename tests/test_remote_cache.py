@@ -151,33 +151,39 @@ def test_content_sharing_dedupes_blob(
 
 
 def test_with_override_enables_cache_transiently(
-    cache_root: Path, fake_fetch, run, monkeypatch: pytest.MonkeyPatch,
+    cache_root: Path, fake_fetch, run, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`cg with config defaults patch cache.enabled=true -- ...` must enable
-    the cache only for the duration of the inner command — `cache_settings`
-    must return `(False, ...)` again afterwards. We capture the override-
-    scoped reading by injecting a marker `_dispatch` like the other `with`
-    test does."""
-    captured: dict = {}
-    from cg import cli
+    """`cg with config defaults patch cache.enabled=true -- <cmd>` enables
+    the cache for the foreign command via CG_DEFAULTS_CONFIG; after the
+    call returns, the parent process sees the default (disabled)."""
+    import os
+    import sys
 
-    real_dispatch = cli._dispatch
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    existing = os.environ.get("PYTHONPATH", "")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        repo_root + (os.pathsep + existing if existing else ""),
+    )
 
-    def fake_dispatch(argv: list[str]) -> int:
-        if argv and argv[0] == "noop":
-            captured["enabled"], captured["ttl"] = config.cache_settings()
-            return 0
-        return real_dispatch(argv)
-
-    monkeypatch.setattr(cli, "_dispatch", fake_dispatch)
-
+    out_file = tmp_path / "out.txt"
+    write_script = tmp_path / "write.py"
+    write_script.write_text(
+        f"import json\n"
+        f"from cg import config\n"
+        f"with open({str(out_file)!r}, 'w') as f:\n"
+        f"    json.dump(list(config.cache_settings()), f)\n"
+    )
     code, _, _ = run(
         "with", "config", "defaults", "patch", "cache.enabled=true",
-        "--", "noop",
+        "--", sys.executable, str(write_script),
     )
     assert code == 0
-    assert captured["enabled"] is True
-    # Outside the `with` scope: cache reverts to system default (disabled).
+    settings = json.loads(out_file.read_text())
+    assert settings[0] is True
+    # Parent process: still default (disabled), because the patch only
+    # lived in the env of the child subprocess.
     assert config.cache_settings()[0] is False
 
 

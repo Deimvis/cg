@@ -1,6 +1,8 @@
 import argparse
 import copy
 import json
+import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -408,15 +410,23 @@ def _apply_with_head(head: list[str], current: dict) -> dict:
 
 
 def _run_with(argv: list[str]) -> int:
-    """`cg with <config-mutation> -- <next>` — apply a transient defaults
-    patch for the duration of `<next>`. Stacks: `<next>` may itself begin
-    with `with`."""
+    """`cg with <config-mutation> -- <foreign-cmd>...` — apply a transient
+    defaults patch and exec `<foreign-cmd>` with `CG_DEFAULTS_CONFIG`
+    pointing at the patched file. The foreign command can itself be `cg`
+    (or invoke `cg` indirectly via tools like `make`); nested `cg` runs
+    pick up the patched config through the env var.
+
+    The patched config is written to a private tmp file that lives for the
+    duration of the foreign command. Stdio is inherited from the parent
+    so colors, TTY detection, and interactive prompts all behave exactly
+    as if the user had typed the foreign command directly.
+    """
     head, tail = _split_on_double_dash(argv)
     if not head:
         raise SystemExit("cg with: missing mutation spec before '--'")
     if not tail:
         raise SystemExit(
-            "cg with: missing '--' separator and inner command after the "
+            "cg with: missing '--' separator and command after the "
             "mutation spec"
         )
     if head[0] != "config":
@@ -433,20 +443,22 @@ def _run_with(argv: list[str]) -> int:
         with tmp_path.open("w") as f:
             json.dump(patched_data, f, indent=2)
             f.write("\n")
-        prev = config.set_defaults_path_override(tmp_path)
+        env = {**os.environ, config.DEFAULTS_CONFIG_ENV: str(tmp_path)}
         try:
-            return _dispatch(tail)
-        finally:
-            config.set_defaults_path_override(prev)
+            result = subprocess.run(tail, env=env)
+        except FileNotFoundError:
+            raise SystemExit(f"cg with: command not found: {tail[0]!r}")
+        return result.returncode
 
 
-def _dispatch(argv: list[str]) -> int:
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
         raise SystemExit("cg: empty command")
     if argv[0] == "with":
-        return _run_with(argv[1:])
+        sys.exit(_run_with(argv[1:]))
     if argv[0] == "config":
-        return _run_config(argv[1:])
+        sys.exit(_run_config(argv[1:]))
     args = _build_parser().parse_args(argv)
     _resolve_impl(args)
     openapi_lib.OUTPUT_TYPE = args.dst_type
@@ -456,12 +468,6 @@ def _dispatch(argv: list[str]) -> int:
         _run_sql(args)
     else:
         raise SystemExit(f"unsupported --src-type: {args.src_type}")
-    return 0
-
-
-def main(argv: list[str] | None = None) -> None:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    sys.exit(_dispatch(argv))
 
 
 if __name__ == "__main__":

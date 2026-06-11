@@ -4,9 +4,6 @@ Each test gets:
   - a private XDG_CONFIG_HOME pointed at a tmp_path subdir (via monkeypatch),
   - a `run` callable that invokes `cg.cli.main(argv)` in-process and returns
     `(exit_code, stdout, stderr)`.
-
-In-process invocation lets us assert on `cg.config` module state too — e.g.,
-that `set_defaults_path_override` was restored after `cg with` returned.
 """
 
 from __future__ import annotations
@@ -27,9 +24,9 @@ def xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point XDG_CONFIG_HOME at a per-test directory. Returns the dir."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     # `defaults_path()` consults XDG_CONFIG_HOME each call, so no further
-    # caching to clear. But make sure the override is clean (in case a
-    # prior test left it set after a crash).
-    config.set_defaults_path_override(None)
+    # caching to clear. But make sure any inherited CG_DEFAULTS_CONFIG
+    # from the parent env doesn't leak into the test.
+    monkeypatch.delenv(config.DEFAULTS_CONFIG_ENV, raising=False)
     return tmp_path
 
 
