@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import json
 import os
+import shutil
 import socket
 import tempfile
 import time
@@ -444,6 +446,118 @@ def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = N
     return data, content_type
 
 
+def _persistent_cache_root() -> Path:
+    from . import config
+    return config.cache_dir() / "refs"
+
+
+def _url_index_path(url: str) -> Path:
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    return _persistent_cache_root() / "index" / f"{digest}.json"
+
+
+def _blob_path_for(data: bytes) -> Path:
+    digest = hashlib.sha256(data).hexdigest()
+    return _persistent_cache_root() / "blobs" / digest
+
+
+def _ensure_cache_dirs() -> None:
+    root = _persistent_cache_root()
+    (root / "blobs").mkdir(parents=True, exist_ok=True)
+    (root / "index").mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(root.parent, 0o700)
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+
+
+def _load_index_entry(url: str) -> dict | None:
+    path = _url_index_path(url)
+    if not path.exists():
+        return None
+    try:
+        with path.open("r") as f:
+            entry = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("url") != url:
+        # SHA-1 collision (or stale entry from a renamed URL scheme); miss.
+        return None
+    return entry
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".tmp.{os.getpid()}.{path.name}"
+    with tmp.open("wb") as f:
+        f.write(data)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def _materialize_scratch(blob: Path, basename: str) -> Path:
+    """Return a path in the per-process scratch dir whose contents are the
+    cached blob. Uses a hardlink so the inode is shared (no copy cost); falls
+    back to a byte copy on cross-device or unsupported filesystems."""
+    digest_short = blob.name[:12]
+    scratch = _cache_dir() / f"{digest_short}-{basename}"
+    if scratch.exists():
+        try:
+            scratch.unlink()
+        except OSError:
+            pass
+    try:
+        os.link(blob, scratch)
+    except OSError:
+        shutil.copyfile(blob, scratch)
+    return scratch
+
+
+def _lookup_persistent(url: str, ttl_s: int) -> Path | None:
+    """Return a scratch path materialized from the cached blob if the URL has
+    a fresh entry whose blob still exists on disk. Else None."""
+    entry = _load_index_entry(url)
+    if entry is None:
+        return None
+    ts = entry.get("ts")
+    blob_hex = entry.get("blob")
+    basename = entry.get("basename") or "remote.yaml"
+    if not isinstance(ts, (int, float)) or not isinstance(blob_hex, str):
+        return None
+    if time.time() - ts > ttl_s:
+        return None
+    blob = _persistent_cache_root() / "blobs" / blob_hex
+    if not blob.exists():
+        return None
+    return _materialize_scratch(blob, basename)
+
+
+def _store_persistent(url: str, data: bytes, basename: str) -> Path:
+    """Write `data` to the blob store (if absent) and update the URL index.
+    Returns the blob path."""
+    _ensure_cache_dirs()
+    blob = _blob_path_for(data)
+    if not blob.exists():
+        _atomic_write_bytes(blob, data)
+    entry = {
+        "url": url,
+        "blob": blob.name,
+        "ts": int(time.time()),
+        "basename": basename,
+    }
+    _atomic_write_bytes(
+        _url_index_path(url),
+        (json.dumps(entry) + "\n").encode("utf-8"),
+    )
+    return blob
+
+
 def fetch(url: str, source: str | Path | None = None) -> Path:
     """Download `url` (after normalization) into the cache and return the local path.
 
@@ -462,6 +576,16 @@ def fetch(url: str, source: str | Path | None = None) -> Path:
     for c, _ in candidates:
         if c in _CACHE_PATH_BY_URL:
             return _CACHE_PATH_BY_URL[c]
+
+    from . import config
+    cache_enabled, cache_ttl_s = config.cache_settings()
+    if cache_enabled:
+        for c, _ in candidates:
+            hit = _lookup_persistent(c, cache_ttl_s)
+            if hit is not None:
+                _CACHE_PATH_BY_URL[c] = hit
+                _URL_BY_CACHE_PATH[hit] = c
+                return hit
 
     last_404: tuple[str, str] | None = None
     data: bytes | None = None
@@ -492,9 +616,13 @@ def fetch(url: str, source: str | Path | None = None) -> Path:
 
     parsed = urllib.parse.urlparse(canonical)
     basename = os.path.basename(parsed.path) or "remote.yaml"
-    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
-    local = _cache_dir() / f"{digest}-{basename}"
-    local.write_bytes(data)
+    if cache_enabled:
+        blob = _store_persistent(canonical, data, basename)
+        local = _materialize_scratch(blob, basename)
+    else:
+        digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
+        local = _cache_dir() / f"{digest}-{basename}"
+        local.write_bytes(data)
 
     _CACHE_PATH_BY_URL[canonical] = local
     _URL_BY_CACHE_PATH[local] = canonical

@@ -453,6 +453,37 @@ def effective_defaults() -> dict[str, Any]:
     return _deep_merge(SYSTEM_DEFAULTS, load_defaults())
 
 
+def cache_dir() -> Path:
+    """Directory for persistent caches. XDG-aware, mirrors `config_dir`."""
+    base = os.environ.get("XDG_CACHE_HOME")
+    if base:
+        return Path(base) / "cg"
+    return Path.home() / ".cache" / "cg"
+
+
+_TTL_SECONDS_PER_KEY: dict[str, int] = {
+    "d": 86400, "h": 3600, "m": 60, "s": 1,
+    "ms": 0, "mcs": 0, "ns": 0,
+}
+
+
+def cache_settings() -> tuple[bool, int]:
+    """Return `(enabled, ttl_seconds)` from the defaults config. The user's
+    `cache.ttl`, if present, replaces the system default's `ttl` outright
+    (the merge happens at the `ttl` key, not inside it — matching the patch
+    semantics where a dict value at a leaf path replaces, not deep-merges).
+    Sub-second TTL components round down to zero."""
+    user = load_defaults().get("cache", {}) or {}
+    sys_cache = SYSTEM_DEFAULTS["cache"]
+    enabled = bool(user.get("enabled", sys_cache["enabled"]))
+    ttl = user["ttl"] if "ttl" in user else sys_cache["ttl"]
+    seconds = sum(
+        int(ttl.get(k, 0)) * _TTL_SECONDS_PER_KEY[k]
+        for k in _TTL_SECONDS_PER_KEY
+    )
+    return enabled, max(seconds, 0)
+
+
 def token_for_domain(domain: str) -> str | None:
     """Return the configured token for `domain`, or None if none is set."""
     data = load_providers()
