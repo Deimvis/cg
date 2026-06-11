@@ -298,13 +298,56 @@ def _run_config(argv: list[str]) -> int:
     add.add_argument("domain", nargs="?", help="domain, e.g. gitlab.com or github.corp.example")
     add.add_argument("token", nargs="?", help="auth token")
 
+    defaults = sub.add_parser("defaults", help="manage default behavioral config")
+    defaults_actions = defaults.add_subparsers(dest="action")
+    defaults_actions.add_parser(
+        "init",
+        help="create defaults config with system defaults if absent",
+    )
+    defaults_actions.add_parser(
+        "reset",
+        help="overwrite defaults config with system defaults",
+    )
+    patch = defaults_actions.add_parser(
+        "patch",
+        help="apply updates to defaults config",
+    )
+    patch.add_argument(
+        "-t", "--type",
+        dest="patch_type",
+        choices=config.PATCH_TYPES,
+        default="kv",
+        help=(
+            "how to interpret positional inputs (kv = <dotted.path>=<value>, "
+            "patch-file = path to patch file [not yet implemented])"
+        ),
+    )
+    patch.add_argument(
+        "inputs",
+        nargs="+",
+        help=(
+            "for -t kv: dotted-path assignments (cache.enabled=true, "
+            "cache.ttl={d:14}); for -t patch-file: paths to patch files"
+        ),
+    )
+
     args = parser.parse_args(argv)
-    if args.topic != "providers":
+    if args.topic == "providers":
+        if args.action is None:
+            return config.cmd_list()
+        if args.action == "add":
+            return config.cmd_add(args.provider, args.domain, args.token)
         return 2
-    if args.action is None:
-        return config.cmd_list()
-    if args.action == "add":
-        return config.cmd_add(args.provider, args.domain, args.token)
+    if args.topic == "defaults":
+        if args.action is None:
+            return config.cmd_defaults_show()
+        if args.action == "init":
+            return config.cmd_defaults_init()
+        if args.action == "reset":
+            return config.cmd_defaults_reset()
+        if args.action == "patch":
+            return config.cmd_defaults_patch(args.patch_type, args.inputs)
+        return 2
     return 2
 
 

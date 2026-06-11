@@ -317,6 +317,127 @@ def save_providers(data: dict[str, list[dict[str, str]]]) -> Path:
     return path
 
 
+DEFAULTS_FILENAME = "defaults.json"
+
+SYSTEM_DEFAULTS: dict[str, Any] = {
+    "cache": {"enabled": False, "ttl": {"d": 7}},
+}
+
+_DURATION_KEYS = ("d", "h", "m", "s", "ms", "mcs", "ns")
+
+
+def defaults_path() -> Path:
+    return config_dir() / DEFAULTS_FILENAME
+
+
+def _validate_defaults(data: Any, path: Path) -> None:
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path}: top-level must be an object")
+    unknown = set(data.keys()) - set(SYSTEM_DEFAULTS.keys())
+    if unknown:
+        raise SystemExit(
+            f"{path}: unknown key(s) {sorted(unknown)!r}; "
+            f"allowed: {sorted(SYSTEM_DEFAULTS.keys())!r}"
+        )
+    if "cache" in data:
+        _validate_cache(data["cache"], path)
+
+
+def _validate_cache(value: Any, path: Path) -> None:
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path}: 'cache' must be an object")
+    allowed = {"enabled", "ttl"}
+    unknown = set(value.keys()) - allowed
+    if unknown:
+        raise SystemExit(
+            f"{path}: unknown key(s) under 'cache': {sorted(unknown)!r}; "
+            f"allowed: {sorted(allowed)!r}"
+        )
+    if "enabled" in value and not isinstance(value["enabled"], bool):
+        raise SystemExit(
+            f"{path}: 'cache.enabled' must be a boolean, got "
+            f"{type(value['enabled']).__name__}"
+        )
+    if "ttl" in value:
+        _validate_duration(value["ttl"], path, "cache.ttl")
+
+
+def _validate_duration(value: Any, path: Path, loc: str) -> None:
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path}: {loc!r} must be an object")
+    unknown = set(value.keys()) - set(_DURATION_KEYS)
+    if unknown:
+        raise SystemExit(
+            f"{path}: unknown key(s) under {loc!r}: {sorted(unknown)!r}; "
+            f"allowed: {list(_DURATION_KEYS)!r}"
+        )
+    if not value:
+        raise SystemExit(f"{path}: {loc!r} must set at least one component")
+    total = 0
+    for k, v in value.items():
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise SystemExit(
+                f"{path}: {loc}.{k} must be a non-negative integer, got "
+                f"{type(v).__name__}"
+            )
+        if v < 0:
+            raise SystemExit(f"{path}: {loc}.{k} must be >= 0, got {v}")
+        total += v
+    if total == 0:
+        raise SystemExit(f"{path}: {loc!r} total duration must be > 0")
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Return a new dict: `overlay` recursively merged onto `base`. When both
+    sides have a dict at the same key, recurse; otherwise the overlay value
+    wins (and a non-dict overlay replaces a dict base outright)."""
+    out: dict[str, Any] = {}
+    for k, v in base.items():
+        out[k] = dict(v) if isinstance(v, dict) else v
+    for k, v in overlay.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = dict(v) if isinstance(v, dict) else v
+    return out
+
+
+def load_defaults() -> dict[str, Any]:
+    """Read the defaults file. Returns `{}` if absent. Validates strictly."""
+    path = defaults_path()
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"{path}: invalid JSON: {e}")
+    _validate_defaults(data, path)
+    return data
+
+
+def save_defaults(data: dict[str, Any]) -> Path:
+    path = defaults_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    with path.open("w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def effective_defaults() -> dict[str, Any]:
+    """User file deep-merged onto SYSTEM_DEFAULTS. User keys win."""
+    return _deep_merge(SYSTEM_DEFAULTS, load_defaults())
+
+
 def token_for_domain(domain: str) -> str | None:
     """Return the configured token for `domain`, or None if none is set."""
     data = load_providers()
@@ -484,4 +605,176 @@ def cmd_add(provider: str | None, domain: str | None, token: str | None) -> int:
     path, updated = _upsert(provider, domain, token)
     action = "updated" if updated else "added"
     print(f"{action} {provider}/{domain} in {path}")
+    return 0
+
+
+PATCH_TYPES = ("kv", "patch-file")
+
+
+def _parse_kv_scalar(raw: str) -> Any:
+    """Coerce a bare (un-braced) RHS token into bool/int/string."""
+    s = raw.strip()
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
+def _split_top_level(body: str, sep: str) -> list[str]:
+    """Split `body` on `sep` chars that are at brace-depth 0. Used to break
+    an object body `a:1,b:{c:2,d:3}` into [`a:1`, `b:{c:2,d:3}`]."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(body):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                raise SystemExit(f"unmatched '}}' in {body!r}")
+        elif ch == sep and depth == 0:
+            parts.append(body[start:i])
+            start = i + 1
+    if depth != 0:
+        raise SystemExit(f"unmatched '{{' in {body!r}")
+    parts.append(body[start:])
+    return parts
+
+
+def _parse_kv_value(raw: str, arg: str) -> Any:
+    """Parse the RHS of a patch arg. Supports bool / int / string scalars and
+    braced objects `{k:v,k2:v2}` (recursive). `arg` is the original full
+    argument, used only for error messages."""
+    s = raw.strip()
+    if not s.startswith("{"):
+        return _parse_kv_scalar(s)
+    if not s.endswith("}"):
+        raise SystemExit(f"{arg!r}: braced value must end with '}}'")
+    body = s[1:-1].strip()
+    if not body:
+        raise SystemExit(f"{arg!r}: empty object value is not allowed")
+    out: dict[str, Any] = {}
+    for piece in _split_top_level(body, ","):
+        piece = piece.strip()
+        if not piece:
+            raise SystemExit(f"{arg!r}: empty entry in object value")
+        if ":" not in piece:
+            raise SystemExit(
+                f"{arg!r}: missing ':' inside object value (got {piece!r}); "
+                f"use 'key:value' inside braces"
+            )
+        depth = 0
+        colon_idx = -1
+        for i, ch in enumerate(piece):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            elif ch == ":" and depth == 0:
+                colon_idx = i
+                break
+        if colon_idx < 0:
+            raise SystemExit(
+                f"{arg!r}: missing top-level ':' inside object value piece {piece!r}"
+            )
+        key = piece[:colon_idx].strip()
+        val_raw = piece[colon_idx + 1:].strip()
+        if not key:
+            raise SystemExit(f"{arg!r}: empty key in object value")
+        if key in out:
+            raise SystemExit(f"{arg!r}: duplicate key {key!r} in object value")
+        out[key] = _parse_kv_value(val_raw, arg)
+    return out
+
+
+def _parse_kv_arg(arg: str) -> tuple[list[str], Any]:
+    """Parse one positional patch arg of the form `<dotted.path>=<value>`."""
+    if "=" not in arg:
+        raise SystemExit(
+            f"{arg!r}: expected '<dotted.path>=<value>' (missing '=')"
+        )
+        # NB: a braced value may itself contain `=`-free content; we split on
+        # the first '=' before any '{' so this is unambiguous.
+    eq_idx = arg.find("=")
+    brace_idx = arg.find("{")
+    if 0 <= brace_idx < eq_idx:
+        raise SystemExit(
+            f"{arg!r}: '=' must come before '{{' (no '=' found in dotted-path part)"
+        )
+    path_raw = arg[:eq_idx]
+    value_raw = arg[eq_idx + 1:]
+    if not path_raw:
+        raise SystemExit(f"{arg!r}: empty dotted path before '='")
+    parts = path_raw.split(".")
+    if any(not p for p in parts):
+        raise SystemExit(f"{arg!r}: empty segment in dotted path {path_raw!r}")
+    return parts, _parse_kv_value(value_raw, arg)
+
+
+def _patch_set(target: dict[str, Any], path: list[str], value: Any) -> None:
+    """Set `value` at nested `path` inside `target`, replacing whatever is
+    there (including a dict)."""
+    cur = target
+    for seg in path[:-1]:
+        nxt = cur.get(seg)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[seg] = nxt
+        cur = nxt
+    cur[path[-1]] = value
+
+
+def cmd_defaults_show() -> int:
+    """`cg config defaults` — print the effective view (system defaults merged
+    with the user file, if any)."""
+    print(f"# {defaults_path()} (effective view, system defaults merged)")
+    print(json.dumps(effective_defaults(), indent=2))
+    return 0
+
+
+def cmd_defaults_init() -> int:
+    path = defaults_path()
+    if path.exists():
+        print(f"defaults config already exists at {path}")
+        return 0
+    save_defaults(SYSTEM_DEFAULTS)
+    print(f"created {path}")
+    return 0
+
+
+def cmd_defaults_reset() -> int:
+    path = defaults_path()
+    existed = path.exists()
+    save_defaults(SYSTEM_DEFAULTS)
+    print(f"{'overwrote' if existed else 'created'} {path}")
+    return 0
+
+
+def cmd_defaults_patch(patch_type: str, inputs: list[str]) -> int:
+    if patch_type == "patch-file":
+        raise SystemExit(
+            "cg config defaults patch -t patch-file: not yet implemented"
+        )
+    if patch_type != "kv":
+        raise SystemExit(
+            f"cg config defaults patch: unknown -t value {patch_type!r}; "
+            f"expected one of: {', '.join(PATCH_TYPES)}"
+        )
+    if not inputs:
+        raise SystemExit(
+            "cg config defaults patch: at least one <dotted.path>=<value> "
+            "argument required"
+        )
+    merged = _deep_merge({}, load_defaults())
+    for raw in inputs:
+        path_parts, value = _parse_kv_arg(raw)
+        _patch_set(merged, path_parts, value)
+    _validate_defaults(merged, defaults_path())
+    out_path = save_defaults(merged)
+    print(f"patched {out_path}")
     return 0
