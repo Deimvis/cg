@@ -70,8 +70,9 @@ def _set_cache(
     ttl: dict[str, int] | None = None,
 ) -> None:
     """Write the whole `cache.*` subtree in one go so the test's config is
-    explicit, not relying on system defaults."""
-    cats = categories if categories is not None else ["invalidatable"]
+    explicit, not relying on system defaults. Default `categories` mirrors
+    the system default."""
+    cats = categories if categories is not None else ["all", "invalidatable"]
     cats_body = "[" + ",".join(cats) + "]"
     read = (
         f"{{enabled:{str(read_enabled).lower()},"
@@ -115,25 +116,29 @@ def test_master_switch_off_no_reads_no_writes(
     assert p2.read_bytes() == b"hello\n"
 
 
-def test_default_read_only_serves_invalidatable_entries(
+def test_categories_invalidatable_only_skips_non_invalidatable_entries(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    """`categories=[invalidatable]` (the system default) skips entries that
-    have no ETag/Last-Modified: the second process re-fetches."""
-    _set_cache(run, invalidation_first=False)  # don't add a revalidation call
-    # No headers on URL_A → entry classified `all`.
+    """`categories=[invalidatable]` rejects entries with no cheap-check
+    invalidator (ETag/Last-Modified don't qualify — server can return the
+    full body on a conditional GET, which is no cheaper than a normal
+    fetch). With nothing currently classified as invalidatable, this is
+    equivalent to read-off."""
+    fake_fetch["headers"][URL_A] = {"ETag": '"v1"'}
+    _set_cache(run, categories=["invalidatable"], invalidation_first=False)
     remote.fetch(URL_A)
     assert len(fake_fetch["log"]) == 1
     _simulate_new_process()
     remote.fetch(URL_A)
-    # Category mismatch → miss → network hit again.
+    # ETag does NOT classify as invalidatable → category mismatch → miss.
     assert len(fake_fetch["log"]) == 2
 
 
-def test_categories_all_serves_non_invalidatable_entries(
+def test_categories_all_serves_any_cached_entry(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    """`categories=[all]` admits entries without invalidators."""
+    """`categories=[all]` serves any cached entry within TTL, regardless of
+    invalidator availability — no conditional GET, no network round trip."""
     _set_cache(run, categories=["all"], invalidation_first=False)
     remote.fetch(URL_A)
     assert len(fake_fetch["log"]) == 1
@@ -142,74 +147,69 @@ def test_categories_all_serves_non_invalidatable_entries(
     assert len(fake_fetch["log"]) == 1  # served from disk
 
 
-def test_invalidatable_hit_with_etag_serves_without_invalidation(
+def test_categories_all_with_invalidation_first_still_skips_network(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    """With an ETag stored and `invalidation_first=false`, the hit is served
-    from cache without a network round-trip."""
+    """`invalidation_first=true` is a no-op for non-invalidatable entries.
+    With `categories=[all]` and an ETag-only entry (which classifies as
+    `all`, not `invalidatable`), the second process serves the cached blob
+    without any conditional GET. This is the contract that lets `make
+    ci-cached` survive a flaky upstream."""
     fake_fetch["headers"][URL_A] = {"ETag": '"v1"'}
-    _set_cache(run, invalidation_first=False)
+    _set_cache(run, categories=["all"])  # invalidation_first=true by default
     remote.fetch(URL_A)
     assert len(fake_fetch["log"]) == 1
     _simulate_new_process()
     remote.fetch(URL_A)
-    assert len(fake_fetch["log"]) == 1
+    assert len(fake_fetch["log"]) == 1  # no revalidation call
 
 
-def test_invalidation_first_304_serves_cached(
+def test_etag_and_last_modified_are_still_captured(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    """invalidation_first=true on an invalidatable hit issues a conditional
-    GET; a 304 response serves the cached blob and refreshes the entry's
-    `invalidation_ts`."""
-    fake_fetch["headers"][URL_A] = {"ETag": '"v1"'}
-    _set_cache(run)  # default invalidation_first=true
+    """The schema persists ETag/Last-Modified into the `invalidation`
+    subobject for future use, even though they don't currently make an
+    entry invalidatable."""
+    fake_fetch["headers"][URL_A] = {"ETag": '"v1"', "Last-Modified": "yes"}
+    _set_cache(run, categories=["all"])
     remote.fetch(URL_A)
-    assert len(fake_fetch["log"]) == 1
-    idx_path = remote._url_index_path(URL_A)
-    original_ts = json.loads(idx_path.read_text())["invalidation_ts"]
-    # Force the timestamp backwards so the refresh is visible.
-    entry = json.loads(idx_path.read_text())
-    entry["invalidation_ts"] = original_ts - 100
-    idx_path.write_text(json.dumps(entry) + "\n")
-
-    _simulate_new_process()
-    fake_fetch["not_modified"][URL_A] = True
-    p = remote.fetch(URL_A)
-    # The revalidation call was issued (count went up) but the blob wasn't
-    # re-downloaded; we served bytes from the original cache.
-    assert len(fake_fetch["log"]) == 2
-    assert fake_fetch["log"][-1][2] == {"If-None-Match": '"v1"'}
-    assert p.read_bytes() == b"hello\n"
-    refreshed_ts = json.loads(idx_path.read_text())["invalidation_ts"]
-    assert refreshed_ts > entry["invalidation_ts"]
-
-
-def test_invalidation_first_200_restores_new_bytes(
-    cache_root: Path, fake_fetch, run,
-) -> None:
-    """invalidation_first=true with a 200 response (upstream changed within
-    TTL) re-stores the new bytes and serves them."""
-    fake_fetch["headers"][URL_A] = {"ETag": '"v1"'}
-    fake_fetch["responses"][URL_A] = b"old"
-    _set_cache(run)
-    remote.fetch(URL_A)
-
-    _simulate_new_process()
-    # Upstream now returns different bytes + a new ETag, no 304.
-    fake_fetch["responses"][URL_A] = b"new"
-    fake_fetch["headers"][URL_A] = {"ETag": '"v2"'}
-    p = remote.fetch(URL_A)
-    assert p.read_bytes() == b"new"
-    # New blob in the store.
-    blob_names = sorted(b.name for b in (cache_root / "blobs").iterdir())
-    assert len(blob_names) == 2
-    # Index now points to the new bytes' sha256.
-    import hashlib
-    new_sha = hashlib.sha256(b"new").hexdigest()
     entry = json.loads(remote._url_index_path(URL_A).read_text())
-    assert entry["blob_sha256"] == new_sha
-    assert entry["invalidation"] == {"etag_http_header": '"v2"'}
+    assert entry["invalidation"] == {
+        "etag_http_header": '"v1"',
+        "last_modified_http_header": "yes",
+    }
+
+
+def test_revalidation_failure_falls_back_to_cached_blob(
+    cache_root: Path, fake_fetch, run, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a cheap-check invalidator is present AND the revalidation call
+    fails (timeout/5xx/DNS), the cached blob is served anyway. The TTL is
+    the user's stated acceptance of staleness in exchange for resilience.
+
+    No production codepath classifies entries as `invalidatable` yet, so
+    we monkeypatch `_classify` to force the path under test. This locks
+    in the fallback behavior for whenever a real cheap-check invalidator
+    (e.g. `commit_sha1` via the forge commits API) lands."""
+    monkeypatch.setattr(remote, "_classify", lambda inv: "invalidatable")
+    _set_cache(run, categories=["invalidatable"])
+    remote.fetch(URL_A)
+    assert len(fake_fetch["log"]) == 1
+
+    call_count = [0]
+    original_stub = remote._attempt_fetch
+
+    def failing_stub(url, auth_host, source=None, conditional=None):
+        call_count[0] += 1
+        if conditional is not None:
+            raise SystemExit(f"fetch timed out after 10s\n  ref to: {url}")
+        return original_stub(url, auth_host, source=source, conditional=conditional)
+
+    monkeypatch.setattr(remote, "_attempt_fetch", failing_stub)
+    _simulate_new_process()
+    p = remote.fetch(URL_A)
+    assert call_count[0] == 1
+    assert p.read_bytes() == b"hello\n"
 
 
 def test_write_only_mode_populates_but_never_reads(
@@ -243,8 +243,7 @@ def test_write_disabled_skips_persistent_store(
 def test_ttl_expired_triggers_refetch(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    fake_fetch["headers"][URL_A] = {"ETag": '"v1"'}
-    _set_cache(run, ttl={"s": 1}, invalidation_first=False)
+    _set_cache(run, categories=["all"], ttl={"s": 1}, invalidation_first=False)
     remote.fetch(URL_A)
     assert len(fake_fetch["log"]) == 1
     _simulate_new_process()
@@ -261,8 +260,7 @@ def test_ttl_expired_triggers_refetch(
 def test_blob_missing_triggers_refetch(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    fake_fetch["headers"][URL_A] = {"ETag": '"v1"'}
-    _set_cache(run, invalidation_first=False)
+    _set_cache(run, categories=["all"], invalidation_first=False)
     remote.fetch(URL_A)
     blobs = list((cache_root / "blobs").iterdir())
     blobs[0].unlink()
@@ -275,7 +273,7 @@ def test_blob_missing_triggers_refetch(
 def test_content_sharing_dedupes_blob(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    _set_cache(run, invalidation_first=False)
+    _set_cache(run, categories=["all"], invalidation_first=False)
     fake_fetch["responses"][URL_A] = b"same-bytes"
     fake_fetch["responses"][URL_B] = b"same-bytes"
     p1 = remote.fetch(URL_A)
@@ -289,8 +287,7 @@ def test_content_sharing_dedupes_blob(
 def test_returned_path_preserves_yaml_suffix(
     cache_root: Path, fake_fetch, run,
 ) -> None:
-    fake_fetch["headers"][URL_A] = {"ETag": '"v1"'}
-    _set_cache(run, invalidation_first=False)
+    _set_cache(run, categories=["all"], invalidation_first=False)
     p = remote.fetch(URL_A)
     assert p.suffix == ".yaml"
     _simulate_new_process()

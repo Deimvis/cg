@@ -528,9 +528,19 @@ def _load_index_entry(url: str) -> dict | None:
 
 
 def _classify(invalidation: dict) -> str:
-    """Return `"invalidatable"` if the entry has any invalidator we know how
-    to use, else `"all"` (eligible for read only when `categories` admits it)."""
-    if invalidation.get("etag_http_header") or invalidation.get("last_modified_http_header"):
+    """Return `"invalidatable"` if the entry has a *cheap* invalidator —
+    one we can check **without re-fetching the blob**. HTTP ETag and
+    Last-Modified do **not** qualify: the server is free to ignore the
+    conditional headers and serve a full 200 response, which is no cheaper
+    than a normal fetch. The slot for the first true cheap-check
+    invalidator is `commit_sha1` (compared against a small JSON response
+    from a forge's commits API); see `cache.read.categories` semantics.
+
+    Until a cheap-check invalidator is wired in, every entry is classified
+    `"all"`. ETag/Last-Modified are still captured into the index so a
+    future feature (or external tooling) can use them, but they don't
+    influence the classification."""
+    if invalidation.get("commit_sha1"):
         return "invalidatable"
     return "all"
 
@@ -634,9 +644,21 @@ def _lookup_persistent(
                 url, auth_host, source=source, conditional=cond,
             )
         except _NotFound:
-            # Upstream is gone; the cached blob is what we have. Pretend the
-            # hit was clean — caller may still hit the 404 path on a re-fetch
-            # but right now we have known-good bytes.
+            # Upstream says 404 now but we have known-good bytes from a
+            # previous fetch. Serve them; if the caller needs *new* content
+            # for some other reason it'll see the 404 then.
+            return _materialize_scratch(blob, basename), None, {}
+        except SystemExit as e:
+            # Network failure during revalidation (timeout, DNS failure,
+            # 5xx). The whole point of a cache with a non-zero TTL is to
+            # remain useful when upstream is flaky — fall back to the
+            # cached blob instead of propagating the failure. A one-line
+            # note tells the user we're serving stale.
+            import sys
+            sys.stderr.write(
+                f"note: serving cached {basename} ({url}): "
+                f"revalidation failed: {e}\n"
+            )
             return _materialize_scratch(blob, basename), None, {}
         if result is _NOT_MODIFIED:
             # Refresh the entry's freshness window and merge any new headers

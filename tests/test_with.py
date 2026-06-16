@@ -23,7 +23,7 @@ SYSTEM = {
         "ttl": {"d": 7},
         "read": {
             "enabled": True,
-            "categories": ["invalidatable"],
+            "categories": ["all", "invalidatable"],
             "invalidation_first": True,
         },
         "write": {"enabled": True},

@@ -17,7 +17,7 @@ SYSTEM = {
         "ttl": {"d": 7},
         "read": {
             "enabled": True,
-            "categories": ["invalidatable"],
+            "categories": ["all", "invalidatable"],
             "invalidation_first": True,
         },
         "write": {"enabled": True},
@@ -152,7 +152,7 @@ def test_cache_settings_uses_system_defaults_when_no_file(
     s = config.cache_settings()
     assert s.read_enabled is True
     assert s.write_enabled is True
-    assert s.read_categories == frozenset({"invalidatable"})
+    assert s.read_categories == frozenset({"all", "invalidatable"})
     assert s.invalidation_first is True
     assert s.ttl_seconds == 7 * 86400
 

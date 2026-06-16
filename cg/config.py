@@ -328,7 +328,13 @@ SYSTEM_DEFAULTS: dict[str, Any] = {
         "ttl": {"d": 7},
         "read": {
             "enabled": True,
-            "categories": ["invalidatable"],
+            # Both categories until a real cheap-check invalidator (e.g.
+            # GitHub commit SHA via the commits API) is wired in. With only
+            # `invalidatable` listed, no entry currently qualifies, so the
+            # cache would effectively be write-only. Until then, `all`
+            # carries the cache; once `invalidatable` entries can actually
+            # be served via a cheap check, this default can narrow.
+            "categories": ["all", "invalidatable"],
             "invalidation_first": True,
         },
         "write": {"enabled": True},
