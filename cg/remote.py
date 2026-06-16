@@ -366,9 +366,24 @@ def _format_source(source: str | Path | None) -> str | None:
     return str(source)
 
 
-def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = None) -> tuple[bytes, str]:
-    """Single fetch of `canonical`. Returns `(data, content_type)`. Raises
-    `_NotFound` on 404, or `SystemExit` for non-recoverable failures.
+_NOT_MODIFIED = object()
+
+
+def _attempt_fetch(
+    canonical: str,
+    auth_host: str,
+    source: str | Path | None = None,
+    conditional: dict[str, str] | None = None,
+) -> tuple[bytes | object, str, dict[str, str]]:
+    """Single fetch of `canonical`. Returns `(data, content_type, headers)`
+    where `headers` is a dict of selected response headers we may want to
+    persist (ETag, Last-Modified). Raises `_NotFound` on 404 or `SystemExit`
+    on non-recoverable failures.
+
+    If `conditional` is supplied (e.g. `{"If-None-Match": "<etag>"}`), the
+    request is sent with those headers; on HTTP 304 the function returns
+    `(_NOT_MODIFIED, "", headers)` so the caller knows the cached blob is
+    still current.
 
     `auth_host` is the *original* host (pre-mirror) used to look up auth
     credentials. The actual request goes to `canonical`. When `auth_host`
@@ -381,6 +396,9 @@ def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = N
     sent_token = bool(auth_headers)
     for header_name, value in auth_headers.items():
         headers[header_name] = value
+    if conditional:
+        for k, v in conditional.items():
+            headers[k] = v
 
     from . import config
     request_url = canonical
@@ -395,6 +413,7 @@ def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = N
     opener = _opener_for_mode(config.ip_resolution_for_domain(connect_host))
     data: bytes = b""
     content_type = ""
+    response_headers: dict[str, str] = {}
     final_url = request_url
     for attempt in range(_FETCH_MAX_ATTEMPTS):
         try:
@@ -402,8 +421,20 @@ def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = N
                 data = resp.read()
                 content_type = resp.headers.get("Content-Type", "")
                 final_url = resp.geturl()
+                for h in ("ETag", "Last-Modified"):
+                    v = resp.headers.get(h)
+                    if v:
+                        response_headers[h] = v
             break
         except urllib.error.HTTPError as e:
+            if e.code == 304:
+                # 304 carries the validator headers we sent — capture any
+                # fresh ones the server provides so we don't lose state.
+                for h in ("ETag", "Last-Modified"):
+                    v = e.headers.get(h) if e.headers else None
+                    if v:
+                        response_headers[h] = v
+                return _NOT_MODIFIED, "", response_headers
             if e.code == 404:
                 raise _NotFound()
             if e.code in (401, 403):
@@ -443,7 +474,7 @@ def _attempt_fetch(canonical: str, auth_host: str, source: str | Path | None = N
             f"final URL: {final_url}).\n"
             f"{_auth_hint(auth_parsed, sent_token=sent_token, status=200)}"
         )
-    return data, content_type
+    return data, content_type, response_headers
 
 
 def _persistent_cache_root() -> Path:
@@ -473,6 +504,10 @@ def _ensure_cache_dirs() -> None:
 
 
 def _load_index_entry(url: str) -> dict | None:
+    """Read and validate an index entry. Returns the dict only if it matches
+    `url` and has the current schema (`blob_sha256` + `source.url`). Old-
+    shape entries from before this schema are treated as misses (re-fetch
+    will overwrite them in the new shape)."""
     path = _url_index_path(url)
     if not path.exists():
         return None
@@ -483,10 +518,45 @@ def _load_index_entry(url: str) -> dict | None:
         return None
     if not isinstance(entry, dict):
         return None
-    if entry.get("url") != url:
+    if not isinstance(entry.get("blob_sha256"), str):
+        return None
+    source = entry.get("source")
+    if not isinstance(source, dict) or source.get("url") != url:
         # SHA-1 collision (or stale entry from a renamed URL scheme); miss.
         return None
     return entry
+
+
+def _classify(invalidation: dict) -> str:
+    """Return `"invalidatable"` if the entry has any invalidator we know how
+    to use, else `"all"` (eligible for read only when `categories` admits it)."""
+    if invalidation.get("etag_http_header") or invalidation.get("last_modified_http_header"):
+        return "invalidatable"
+    return "all"
+
+
+def _conditional_headers(invalidation: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    etag = invalidation.get("etag_http_header")
+    if isinstance(etag, str) and etag:
+        out["If-None-Match"] = etag
+    last_mod = invalidation.get("last_modified_http_header")
+    if isinstance(last_mod, str) and last_mod:
+        out["If-Modified-Since"] = last_mod
+    return out
+
+
+def _capture_invalidation(response_headers: dict[str, str]) -> dict:
+    """Translate HTTP response headers into the `invalidation` subobject we
+    persist. Empty dict if nothing useful was returned."""
+    out: dict[str, str] = {}
+    etag = response_headers.get("ETag")
+    if etag:
+        out["etag_http_header"] = etag
+    last_mod = response_headers.get("Last-Modified")
+    if last_mod:
+        out["last_modified_http_header"] = last_mod
+    return out
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -519,41 +589,112 @@ def _materialize_scratch(blob: Path, basename: str) -> Path:
     return scratch
 
 
-def _lookup_persistent(url: str, ttl_s: int) -> Path | None:
-    """Return a scratch path materialized from the cached blob if the URL has
-    a fresh entry whose blob still exists on disk. Else None."""
+def _lookup_persistent(
+    url: str,
+    auth_host: str,
+    settings,
+    source: str | Path | None,
+) -> tuple[Path, bytes | None, dict[str, str]] | None:
+    """Try to serve `url` from the persistent cache. Returns:
+      - `None` on miss (caller falls through to network fetch);
+      - `(path, None, {})` on a clean hit (no network touched);
+      - `(path, new_bytes, new_response_headers)` when invalidation_first
+        triggered a revalidation that came back as `200` with new bytes —
+        the caller treats this as a fresh fetch result (re-stores the blob).
+    A `304` response refreshes the entry's `invalidation_ts` on disk and is
+    returned as a clean hit.
+    """
     entry = _load_index_entry(url)
     if entry is None:
         return None
-    ts = entry.get("ts")
-    blob_hex = entry.get("blob")
-    basename = entry.get("basename") or "remote.yaml"
-    if not isinstance(ts, (int, float)) or not isinstance(blob_hex, str):
+    if not settings.read_enabled:
         return None
-    if time.time() - ts > ttl_s:
+    ts = entry.get("invalidation_ts")
+    blob_hex = entry["blob_sha256"]
+    basename = entry.get("basename") or "remote.yaml"
+    if not isinstance(ts, (int, float)):
+        return None
+    if time.time() - ts > settings.ttl_seconds:
         return None
     blob = _persistent_cache_root() / "blobs" / blob_hex
     if not blob.exists():
         return None
-    return _materialize_scratch(blob, basename)
+
+    invalidation = entry.get("invalidation") or {}
+    if not isinstance(invalidation, dict):
+        invalidation = {}
+    category = _classify(invalidation)
+    if category not in settings.read_categories:
+        return None
+
+    if settings.invalidation_first and category == "invalidatable":
+        cond = _conditional_headers(invalidation)
+        try:
+            result, _, new_response_headers = _attempt_fetch(
+                url, auth_host, source=source, conditional=cond,
+            )
+        except _NotFound:
+            # Upstream is gone; the cached blob is what we have. Pretend the
+            # hit was clean — caller may still hit the 404 path on a re-fetch
+            # but right now we have known-good bytes.
+            return _materialize_scratch(blob, basename), None, {}
+        if result is _NOT_MODIFIED:
+            # Refresh the entry's freshness window and merge any new headers
+            # the server emitted (rare but legal).
+            merged_invalidation = dict(invalidation)
+            captured = _capture_invalidation(new_response_headers)
+            for k, v in captured.items():
+                merged_invalidation[k] = v
+            _write_index_entry(
+                url, blob_hex, basename, merged_invalidation,
+                int(time.time()),
+            )
+            return _materialize_scratch(blob, basename), None, {}
+        # 200: upstream changed within TTL. Caller stores the new bytes.
+        return _materialize_scratch(blob, basename), result, new_response_headers
+
+    return _materialize_scratch(blob, basename), None, {}
 
 
-def _store_persistent(url: str, data: bytes, basename: str) -> Path:
-    """Write `data` to the blob store (if absent) and update the URL index.
-    Returns the blob path."""
-    _ensure_cache_dirs()
-    blob = _blob_path_for(data)
-    if not blob.exists():
-        _atomic_write_bytes(blob, data)
+def _write_index_entry(
+    url: str,
+    blob_sha256: str,
+    basename: str,
+    invalidation: dict,
+    invalidation_ts: int,
+) -> None:
     entry = {
-        "url": url,
-        "blob": blob.name,
-        "ts": int(time.time()),
+        "blob_sha256": blob_sha256,
+        "invalidation_ts": invalidation_ts,
         "basename": basename,
+        "source": {"url": url},
+        "invalidation": invalidation,
     }
     _atomic_write_bytes(
         _url_index_path(url),
         (json.dumps(entry) + "\n").encode("utf-8"),
+    )
+
+
+def _store_persistent(
+    url: str,
+    data: bytes,
+    basename: str,
+    response_headers: dict[str, str],
+) -> Path:
+    """Write `data` to the blob store (if absent) and update the URL index
+    using the new {blob_sha256, invalidation_ts, basename, source, invalidation}
+    schema. Returns the blob path."""
+    _ensure_cache_dirs()
+    blob = _blob_path_for(data)
+    if not blob.exists():
+        _atomic_write_bytes(blob, data)
+    _write_index_entry(
+        url=url,
+        blob_sha256=blob.name,
+        basename=basename,
+        invalidation=_capture_invalidation(response_headers),
+        invalidation_ts=int(time.time()),
     )
     return blob
 
@@ -578,21 +719,37 @@ def fetch(url: str, source: str | Path | None = None) -> Path:
             return _CACHE_PATH_BY_URL[c]
 
     from . import config
-    cache_enabled, cache_ttl_s = config.cache_settings()
-    if cache_enabled:
-        for c, _ in candidates:
-            hit = _lookup_persistent(c, cache_ttl_s)
-            if hit is not None:
-                _CACHE_PATH_BY_URL[c] = hit
-                _URL_BY_CACHE_PATH[hit] = c
-                return hit
+    settings = config.cache_settings()
+    response_headers: dict[str, str] = {}
+    if settings.read_enabled:
+        for c, auth_host in candidates:
+            result = _lookup_persistent(c, auth_host, settings, source)
+            if result is None:
+                continue
+            local, refetched_bytes, refetched_headers = result
+            _CACHE_PATH_BY_URL[c] = local
+            _URL_BY_CACHE_PATH[local] = c
+            if refetched_bytes is not None and settings.write_enabled:
+                # Revalidation came back with new bytes — overwrite both the
+                # scratch link and the persistent entry.
+                parsed = urllib.parse.urlparse(c)
+                basename = os.path.basename(parsed.path) or "remote.yaml"
+                blob = _store_persistent(
+                    c, refetched_bytes, basename, refetched_headers,
+                )
+                local = _materialize_scratch(blob, basename)
+                _CACHE_PATH_BY_URL[c] = local
+                _URL_BY_CACHE_PATH[local] = c
+            return local
 
     last_404: tuple[str, str] | None = None
     data: bytes | None = None
     canonical: str | None = None
     for c, auth_host in candidates:
         try:
-            data, _ = _attempt_fetch(c, auth_host, source=source)
+            result, _, response_headers = _attempt_fetch(c, auth_host, source=source)
+            assert result is not _NOT_MODIFIED, "unconditional fetch returned 304"
+            data = result  # type: ignore[assignment]
             canonical = c
             break
         except _NotFound:
@@ -616,8 +773,8 @@ def fetch(url: str, source: str | Path | None = None) -> Path:
 
     parsed = urllib.parse.urlparse(canonical)
     basename = os.path.basename(parsed.path) or "remote.yaml"
-    if cache_enabled:
-        blob = _store_persistent(canonical, data, basename)
+    if settings.write_enabled:
+        blob = _store_persistent(canonical, data, basename, response_headers)
         local = _materialize_scratch(blob, basename)
     else:
         digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]

@@ -11,7 +11,18 @@ from cg import config
 from conftest import read_json
 
 
-SYSTEM = {"cache": {"enabled": False, "ttl": {"d": 7}}}
+SYSTEM = {
+    "cache": {
+        "enabled": True,
+        "ttl": {"d": 7},
+        "read": {
+            "enabled": True,
+            "categories": ["invalidatable"],
+            "invalidation_first": True,
+        },
+        "write": {"enabled": True},
+    },
+}
 
 
 def test_show_with_no_file_prints_system_defaults(run, defaults_file: Path) -> None:
@@ -61,9 +72,9 @@ def test_patch_scalar_and_object_value(run, defaults_file: Path) -> None:
         "cache.enabled=true", "cache.ttl={d:14}",
     )
     assert code == 0
-    assert read_json(defaults_file) == {
-        "cache": {"enabled": True, "ttl": {"d": 14}},
-    }
+    on_disk = read_json(defaults_file)
+    assert on_disk["cache"]["enabled"] is True
+    assert on_disk["cache"]["ttl"] == {"d": 14}
 
 
 def test_patch_object_value_replaces_existing_dict(run, defaults_file: Path) -> None:
@@ -71,15 +82,15 @@ def test_patch_object_value_replaces_existing_dict(run, defaults_file: Path) -> 
     run("config", "defaults", "patch", "cache.ttl={d:14}")
     code, _, _ = run("config", "defaults", "patch", "cache.ttl={h:6}")
     assert code == 0
-    assert read_json(defaults_file) == {
-        "cache": {"enabled": False, "ttl": {"h": 6}},
-    }
+    # Whole-object replacement: only h:6, no leftover d:14.
+    assert read_json(defaults_file)["cache"]["ttl"] == {"h": 6}
 
 
 def test_patch_creates_file_when_absent(run, defaults_file: Path) -> None:
     assert not defaults_file.exists()
     code, _, _ = run("config", "defaults", "patch", "cache.enabled=true")
     assert code == 0
+    # Patch without a prior file only writes the keys explicitly patched.
     assert read_json(defaults_file) == {"cache": {"enabled": True}}
 
 
@@ -129,19 +140,54 @@ def test_patch_multiple_args_applied_left_to_right(run, defaults_file: Path) -> 
     )
     assert code == 0
     # Per-arg replacement: second arg's value wins.
-    assert read_json(defaults_file) == {
-        "cache": {"enabled": False, "ttl": {"h": 3}},
-    }
+    assert read_json(defaults_file)["cache"]["ttl"] == {"h": 3}
 
 
-def test_effective_defaults_overlays_user_file_on_system(
+def test_cache_settings_uses_system_defaults_when_no_file(
     run, defaults_file: Path,
 ) -> None:
-    """`effective_defaults()` deep-merges user file onto SYSTEM_DEFAULTS so
-    that callers see a complete view even when the user only set one field."""
+    """`cache_settings()` returns the merged view, falling back to system
+    defaults for any subtree the user hasn't set."""
+    assert not defaults_file.exists()
+    s = config.cache_settings()
+    assert s.read_enabled is True
+    assert s.write_enabled is True
+    assert s.read_categories == frozenset({"invalidatable"})
+    assert s.invalidation_first is True
+    assert s.ttl_seconds == 7 * 86400
+
+
+def test_legacy_minimal_schema_still_loads(run, defaults_file: Path) -> None:
+    """A user file from before `read`/`write` were added is still accepted;
+    missing subtrees fall back to system defaults."""
+    defaults_file.parent.mkdir(parents=True, exist_ok=True)
+    defaults_file.write_text('{"cache":{"enabled":false,"ttl":{"d":1}}}\n')
+    s = config.cache_settings()
+    # Master switch off → both gates collapse to False.
+    assert s.read_enabled is False
+    assert s.write_enabled is False
+    assert s.ttl_seconds == 86400
+
+
+def test_patch_rejects_bad_category(run, defaults_file: Path) -> None:
     run("config", "defaults", "init")
-    run("config", "defaults", "patch", "cache.enabled=true")
-    # User file only sets enabled=true; ttl falls back to system default.
-    assert config.effective_defaults() == {
-        "cache": {"enabled": True, "ttl": {"d": 7}},
-    }
+    before = read_json(defaults_file)
+    code, _, err = run(
+        "config", "defaults", "patch",
+        "cache.read={enabled:true,categories:[bogus],invalidation_first:true}",
+    )
+    assert code != 0
+    assert "categories" in err
+    assert read_json(defaults_file) == before
+
+
+def test_patch_rejects_non_bool_read_enabled(run, defaults_file: Path) -> None:
+    run("config", "defaults", "init")
+    before = read_json(defaults_file)
+    code, _, err = run(
+        "config", "defaults", "patch",
+        "cache.read={enabled:nope,categories:[all],invalidation_first:true}",
+    )
+    assert code != 0
+    assert "cache.read.enabled" in err and "boolean" in err
+    assert read_json(defaults_file) == before

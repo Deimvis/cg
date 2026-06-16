@@ -17,7 +17,18 @@ from cg import config
 from conftest import read_json
 
 
-SYSTEM = {"cache": {"enabled": False, "ttl": {"d": 7}}}
+SYSTEM = {
+    "cache": {
+        "enabled": True,
+        "ttl": {"d": 7},
+        "read": {
+            "enabled": True,
+            "categories": ["invalidatable"],
+            "invalidation_first": True,
+        },
+        "write": {"enabled": True},
+    },
+}
 
 # Repo root so child `python -m cg.cli` imports the working-tree package,
 # not any (possibly stale) system install.
@@ -55,8 +66,9 @@ def test_with_patches_only_for_inner_command(
     write_script.write_text(
         f"import json\n"
         f"from cg import config\n"
+        f"s = config.cache_settings()\n"
         f"with open({str(out_file)!r}, 'w') as f:\n"
-        f"    json.dump(list(config.cache_settings()), f)\n"
+        f"    json.dump({{'read_enabled': s.read_enabled, 'ttl': s.ttl_seconds}}, f)\n"
     )
     code, _, _ = run(
         "with", "config", "defaults", "patch", "cache.enabled=true",
@@ -64,7 +76,7 @@ def test_with_patches_only_for_inner_command(
         sys.executable, str(write_script),
     )
     assert code == 0
-    assert json.loads(out_file.read_text()) == [True, 604800]
+    assert json.loads(out_file.read_text()) == {"read_enabled": True, "ttl": 604800}
     assert read_json(defaults_file) == before
 
 
@@ -80,8 +92,9 @@ def test_chained_with_propagates_via_nested_cg(
     write_script.write_text(
         f"import json\n"
         f"from cg import config\n"
+        f"s = config.cache_settings()\n"
         f"with open({str(out_file)!r}, 'w') as f:\n"
-        f"    json.dump(list(config.cache_settings()), f)\n"
+        f"    json.dump({{'read_enabled': s.read_enabled, 'ttl': s.ttl_seconds}}, f)\n"
     )
     code, _, _ = run(
         "with", "config", "defaults", "patch", "cache.enabled=true",
@@ -94,9 +107,9 @@ def test_chained_with_propagates_via_nested_cg(
     )
     assert code == 0
     # Inner patch's ttl (1h) replaces outer's ttl; outer's `enabled=true`
-    # survives because the inner patch is applied on top of (the file the
-    # outer wrote, which had enabled=true).
-    assert json.loads(out_file.read_text()) == [True, 3600]
+    # survives because the inner patch is applied on top of the outer's
+    # tempfile (which already has enabled=true).
+    assert json.loads(out_file.read_text()) == {"read_enabled": True, "ttl": 3600}
     assert read_json(defaults_file) == before
 
 
@@ -175,9 +188,9 @@ def test_persistent_patch_still_writes_real_file(
         "cache.enabled=true", "cache.ttl={d:14}",
     )
     assert code == 0
-    assert read_json(defaults_file) == {
-        "cache": {"enabled": True, "ttl": {"d": 14}},
-    }
+    on_disk = read_json(defaults_file)
+    assert on_disk["cache"]["enabled"] is True
+    assert on_disk["cache"]["ttl"] == {"d": 14}
 
 
 def test_with_init_seeds_transient_view(

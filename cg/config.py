@@ -59,6 +59,7 @@ and `fetch_mode` are optional when `ip_resolution` is set.
 
 from __future__ import annotations
 
+import dataclasses
 import getpass
 import json
 import os
@@ -319,8 +320,19 @@ def save_providers(data: dict[str, list[dict[str, str]]]) -> Path:
 
 DEFAULTS_FILENAME = "defaults.json"
 
+CACHE_CATEGORIES = ("all", "invalidatable")
+
 SYSTEM_DEFAULTS: dict[str, Any] = {
-    "cache": {"enabled": False, "ttl": {"d": 7}},
+    "cache": {
+        "enabled": True,
+        "ttl": {"d": 7},
+        "read": {
+            "enabled": True,
+            "categories": ["invalidatable"],
+            "invalidation_first": True,
+        },
+        "write": {"enabled": True},
+    },
 }
 
 _DURATION_KEYS = ("d", "h", "m", "s", "ms", "mcs", "ns")
@@ -357,7 +369,7 @@ def _validate_defaults(data: Any, path: Path) -> None:
 def _validate_cache(value: Any, path: Path) -> None:
     if not isinstance(value, dict):
         raise SystemExit(f"{path}: 'cache' must be an object")
-    allowed = {"enabled", "ttl"}
+    allowed = {"enabled", "ttl", "read", "write"}
     unknown = set(value.keys()) - allowed
     if unknown:
         raise SystemExit(
@@ -371,6 +383,73 @@ def _validate_cache(value: Any, path: Path) -> None:
         )
     if "ttl" in value:
         _validate_duration(value["ttl"], path, "cache.ttl")
+    if "read" in value:
+        _validate_cache_read(value["read"], path)
+    if "write" in value:
+        _validate_cache_write(value["write"], path)
+
+
+def _validate_cache_read(value: Any, path: Path) -> None:
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path}: 'cache.read' must be an object")
+    allowed = {"enabled", "categories", "invalidation_first"}
+    unknown = set(value.keys()) - allowed
+    if unknown:
+        raise SystemExit(
+            f"{path}: unknown key(s) under 'cache.read': {sorted(unknown)!r}; "
+            f"allowed: {sorted(allowed)!r}"
+        )
+    if "enabled" in value and not isinstance(value["enabled"], bool):
+        raise SystemExit(
+            f"{path}: 'cache.read.enabled' must be a boolean, got "
+            f"{type(value['enabled']).__name__}"
+        )
+    if "invalidation_first" in value and not isinstance(value["invalidation_first"], bool):
+        raise SystemExit(
+            f"{path}: 'cache.read.invalidation_first' must be a boolean, got "
+            f"{type(value['invalidation_first']).__name__}"
+        )
+    if "categories" in value:
+        cats = value["categories"]
+        if not isinstance(cats, list):
+            raise SystemExit(
+                f"{path}: 'cache.read.categories' must be a list, got "
+                f"{type(cats).__name__}"
+            )
+        seen: set[str] = set()
+        for i, c in enumerate(cats):
+            if not isinstance(c, str):
+                raise SystemExit(
+                    f"{path}: 'cache.read.categories[{i}]' must be a string, "
+                    f"got {type(c).__name__}"
+                )
+            if c not in CACHE_CATEGORIES:
+                raise SystemExit(
+                    f"{path}: 'cache.read.categories[{i}]'={c!r} not in "
+                    f"{list(CACHE_CATEGORIES)!r}"
+                )
+            if c in seen:
+                raise SystemExit(
+                    f"{path}: 'cache.read.categories' has duplicate {c!r}"
+                )
+            seen.add(c)
+
+
+def _validate_cache_write(value: Any, path: Path) -> None:
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path}: 'cache.write' must be an object")
+    allowed = {"enabled"}
+    unknown = set(value.keys()) - allowed
+    if unknown:
+        raise SystemExit(
+            f"{path}: unknown key(s) under 'cache.write': {sorted(unknown)!r}; "
+            f"allowed: {sorted(allowed)!r}"
+        )
+    if "enabled" in value and not isinstance(value["enabled"], bool):
+        raise SystemExit(
+            f"{path}: 'cache.write.enabled' must be a boolean, got "
+            f"{type(value['enabled']).__name__}"
+        )
 
 
 def _validate_duration(value: Any, path: Path, loc: str) -> None:
@@ -463,21 +542,41 @@ _TTL_SECONDS_PER_KEY: dict[str, int] = {
 }
 
 
-def cache_settings() -> tuple[bool, int]:
-    """Return `(enabled, ttl_seconds)` from the defaults config. The user's
-    `cache.ttl`, if present, replaces the system default's `ttl` outright
-    (the merge happens at the `ttl` key, not inside it — matching the patch
-    semantics where a dict value at a leaf path replaces, not deep-merges).
-    Sub-second TTL components round down to zero."""
+@dataclasses.dataclass(frozen=True)
+class CacheSettings:
+    """Effective cache configuration. `read_enabled` and `write_enabled`
+    already fold in the master `cache.enabled` switch (so callers don't have
+    to AND it themselves)."""
+    ttl_seconds: int
+    read_enabled: bool
+    read_categories: frozenset[str]
+    invalidation_first: bool
+    write_enabled: bool
+
+
+def cache_settings() -> CacheSettings:
+    """Read the merged cache configuration. The user's `cache.ttl`,
+    `cache.read`, and `cache.write` — if present — replace the corresponding
+    system-default subtree outright (the merge happens at the key, not inside
+    it — matching the patch semantics where a dict value at a leaf path
+    replaces, not deep-merges)."""
     user = load_defaults().get("cache", {}) or {}
     sys_cache = SYSTEM_DEFAULTS["cache"]
-    enabled = bool(user.get("enabled", sys_cache["enabled"]))
+    master = bool(user.get("enabled", sys_cache["enabled"]))
     ttl = user["ttl"] if "ttl" in user else sys_cache["ttl"]
     seconds = sum(
         int(ttl.get(k, 0)) * _TTL_SECONDS_PER_KEY[k]
         for k in _TTL_SECONDS_PER_KEY
     )
-    return enabled, max(seconds, 0)
+    read = user["read"] if "read" in user else sys_cache["read"]
+    write = user["write"] if "write" in user else sys_cache["write"]
+    return CacheSettings(
+        ttl_seconds=max(seconds, 0),
+        read_enabled=master and bool(read.get("enabled", True)),
+        read_categories=frozenset(read.get("categories", ["invalidatable"])),
+        invalidation_first=bool(read.get("invalidation_first", True)),
+        write_enabled=master and bool(write.get("enabled", True)),
+    )
 
 
 def token_for_domain(domain: str) -> str | None:
@@ -667,32 +766,44 @@ def _parse_kv_scalar(raw: str) -> Any:
 
 
 def _split_top_level(body: str, sep: str) -> list[str]:
-    """Split `body` on `sep` chars that are at brace-depth 0. Used to break
-    an object body `a:1,b:{c:2,d:3}` into [`a:1`, `b:{c:2,d:3}`]."""
+    """Split `body` on `sep` chars at depth 0 (outside any `{}` or `[]`).
+    Used to break an object body `a:1,b:{c:2,d:3}` into `["a:1", "b:{c:2,d:3}"]`
+    and a list body `a,[b,c],d` into `["a", "[b,c]", "d"]`."""
     parts: list[str] = []
     depth = 0
     start = 0
     for i, ch in enumerate(body):
-        if ch == "{":
+        if ch in "{[":
             depth += 1
-        elif ch == "}":
+        elif ch in "}]":
             depth -= 1
             if depth < 0:
-                raise SystemExit(f"unmatched '}}' in {body!r}")
+                raise SystemExit(f"unmatched {ch!r} in {body!r}")
         elif ch == sep and depth == 0:
             parts.append(body[start:i])
             start = i + 1
     if depth != 0:
-        raise SystemExit(f"unmatched '{{' in {body!r}")
+        raise SystemExit(f"unmatched bracket in {body!r}")
     parts.append(body[start:])
     return parts
 
 
 def _parse_kv_value(raw: str, arg: str) -> Any:
-    """Parse the RHS of a patch arg. Supports bool / int / string scalars and
-    braced objects `{k:v,k2:v2}` (recursive). `arg` is the original full
-    argument, used only for error messages."""
+    """Parse the RHS of a patch arg. Supports bool / int / string scalars,
+    braced objects `{k:v,k2:v2}` and bracketed lists `[v,v2,...]` (both
+    recursive). `arg` is the original full argument, used only for error
+    messages."""
     s = raw.strip()
+    if s.startswith("["):
+        if not s.endswith("]"):
+            raise SystemExit(f"{arg!r}: bracketed value must end with ']'")
+        body = s[1:-1].strip()
+        if not body:
+            return []
+        return [
+            _parse_kv_value(piece.strip(), arg)
+            for piece in _split_top_level(body, ",")
+        ]
     if not s.startswith("{"):
         return _parse_kv_scalar(s)
     if not s.endswith("}"):
@@ -713,9 +824,9 @@ def _parse_kv_value(raw: str, arg: str) -> Any:
         depth = 0
         colon_idx = -1
         for i, ch in enumerate(piece):
-            if ch == "{":
+            if ch in "{[":
                 depth += 1
-            elif ch == "}":
+            elif ch in "}]":
                 depth -= 1
             elif ch == ":" and depth == 0:
                 colon_idx = i
@@ -744,9 +855,13 @@ def _parse_kv_arg(arg: str) -> tuple[list[str], Any]:
         # the first '=' before any '{' so this is unambiguous.
     eq_idx = arg.find("=")
     brace_idx = arg.find("{")
-    if 0 <= brace_idx < eq_idx:
+    bracket_idx = arg.find("[")
+    open_idxs = [i for i in (brace_idx, bracket_idx) if i >= 0]
+    earliest_open = min(open_idxs) if open_idxs else -1
+    if 0 <= earliest_open < eq_idx:
         raise SystemExit(
-            f"{arg!r}: '=' must come before '{{' (no '=' found in dotted-path part)"
+            f"{arg!r}: '=' must come before '{{' or '[' "
+            f"(no '=' found in dotted-path part)"
         )
     path_raw = arg[:eq_idx]
     value_raw = arg[eq_idx + 1:]

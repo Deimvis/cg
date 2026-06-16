@@ -43,7 +43,10 @@ def test_env_var_redirects_defaults_path(
     monkeypatch.setenv(config.DEFAULTS_CONFIG_ENV, str(custom))
 
     assert config.defaults_path() == custom
-    assert config.cache_settings() == (True, 7200)
+    s = config.cache_settings()
+    assert s.read_enabled is True
+    assert s.write_enabled is True
+    assert s.ttl_seconds == 7200
 
 
 def test_with_propagates_patched_config_to_child_via_env(
@@ -61,10 +64,13 @@ def test_with_propagates_patched_config_to_child_via_env(
     child_script.write_text(textwrap.dedent(f"""
         import json, os
         from cg import config
+        s = config.cache_settings()
         with open({str(out_file)!r}, "w") as f:
             json.dump({{
                 "env": os.environ.get(config.DEFAULTS_CONFIG_ENV),
-                "settings": list(config.cache_settings()),
+                "read_enabled": s.read_enabled,
+                "write_enabled": s.write_enabled,
+                "ttl": s.ttl_seconds,
                 "path": str(config.defaults_path()),
             }}, f)
     """))
@@ -79,5 +85,7 @@ def test_with_propagates_patched_config_to_child_via_env(
     seen = json.loads(out_file.read_text())
     assert seen["env"] is not None
     assert seen["env"].endswith("/defaults.json")
-    assert seen["settings"] == [True, 7200]
+    assert seen["read_enabled"] is True
+    assert seen["write_enabled"] is True
+    assert seen["ttl"] == 7200
     assert read_json(defaults_file) == before
