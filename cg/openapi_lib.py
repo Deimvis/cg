@@ -842,9 +842,9 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
             handler_schema = content['paths'][path][method]
             uri_fields = []
             query_fields = []
+            header_fields = []
             # uri_name2type = dict()
             uri_name2field_name = dict()
-            req_has_headers = False
             for p in handler_schema.get('parameters', []):
                 match p['in']:
                     case 'path':
@@ -879,7 +879,27 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
                         p_def = f'{field_name} {p_def} `{tags}`'
                         query_fields.append(p_def)
                     case 'header':
-                        req_has_headers = True
+                        name = p['name']
+                        p_def = generate_golang_definition(openapi_api_fp, p['schema'])
+                        if p_def.startswith('[]') or p_def.startswith('map[') or p_def.startswith('struct') or p_def.startswith('*'):
+                            raise RuntimeError(
+                                f'Got unsupported structured header type {p_def!r} for {name!r}: '
+                                'only plain types or aliases to plain types are allowed'
+                            )
+                        is_required = 'required' in p and p['required'] is True
+                        if not is_required:
+                            p_def = _apply_optional_policy(p_def, p)
+                        tags = f'header:"{name}"'
+                        header_extra_tags = prop_get(p['schema'], 'go-extra-tags')
+                        if header_extra_tags is not None:
+                            tags += ' ' + header_extra_tags
+                        field_name = prop_get(p, 'go-field-name', _camel_case(name))
+                        if field_name == 'EXTRA':
+                            raise RuntimeError(
+                                f'header field name {field_name!r} for {name!r} conflicts with reserved EXTRA field'
+                            )
+                        p_def = f'{field_name} {p_def} `{tags}`'
+                        header_fields.append(p_def)
                     case _:
                         raise RuntimeError(f'Got unsupported parameter in handler schema: {p}')
 
@@ -902,6 +922,16 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
                 query_code = '\n'.join(query_code_lines)
             else:
                 query_code = 'fw.RequestNoQuery'
+
+            if len(header_fields) > 0:
+                header_code_lines = []
+                header_code_lines.append('fw.RequestStructHeader[struct {')
+                header_code_lines.extend(_indent(header_fields, ' '*8))
+                header_code_lines.append(' '*8 + 'EXTRA http.Header')
+                header_code_lines.append(' '*4 + '}]')
+                header_code = '\n'.join(header_code_lines)
+            else:
+                header_code = 'fw.RequestHeader[fw.JSONHeaderPreset]'
 
             req_body_code = ''
             if method.upper() == 'GET' or 'requestBody' not in handler_schema:
@@ -972,13 +1002,20 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
                 else:
                     resp_code += f'type {cano_path_camel_case}{method.upper()}Response{status_code} = fw.Response{status_code}WithJSONHeader\n'
 
+            imports_lines = ['import (']
+            imports_lines.append(' '*4 + f'"{FW_IMPORT_PATH}"')
+            if len(header_fields) > 0:
+                imports_lines.append(' '*4 + '"net/http"')
+            imports_lines.append(')')
+            imports_code = '\n'.join(imports_lines)
+
             code = '\n'.join([
-                f'import "{FW_IMPORT_PATH}"',
+                imports_code,
                 '',
                 f'type {request_class_name} struct {{',
                 ' '*4 + f'fw.Request{method.upper()}',
                 ' '*4 + f'fw.RequestPathBound',
-                ' '*4 + f'fw.RequestHeader[fw.JSONHeaderPreset]',
+                ' '*4 + header_code,
                 '',
                 ' '*4 + uri_code,
                 ' '*4 + query_code,
