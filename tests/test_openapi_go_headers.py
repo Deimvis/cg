@@ -51,12 +51,14 @@ paths:
 """
     code = _generate(tmp_path, spec)
     assert "fw.RequestStructHeader[fw.JSONHeaderPreset, struct {" in code, code
+    assert "fwheader.WithExtras" in code
     assert 'XEndClientAppInterface *string `header:"X-EndClient-AppInterface"`' in code
     assert 'XEndClientAppSlug *string `header:"X-EndClient-AppSlug"`' in code
-    assert "EXTRA http.Header" in code
-    assert '"net/http"' in code
+    assert '/fwheader"' in code
     # Old single-arg form must not slip back in.
     assert "fw.RequestStructHeader[struct" not in code
+    # Old named EXTRA field must not slip back in.
+    assert "EXTRA http.Header" not in code
 
 
 def test_required_header_is_not_pointer(tmp_path: Path) -> None:
@@ -98,7 +100,7 @@ paths:
     code = _generate(tmp_path, spec)
     assert "fw.RequestHeader[fw.JSONHeaderPreset]" in code, code
     assert "fw.RequestStructHeader" not in code
-    assert '"net/http"' not in code
+    assert "fwheader" not in code
 
 
 def test_header_slice_type_is_rejected(tmp_path: Path) -> None:

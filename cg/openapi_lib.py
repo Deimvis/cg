@@ -894,10 +894,6 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
                         if header_extra_tags is not None:
                             tags += ' ' + header_extra_tags
                         field_name = prop_get(p, 'go-field-name', _camel_case(name))
-                        if field_name == 'EXTRA':
-                            raise RuntimeError(
-                                f'header field name {field_name!r} for {name!r} conflicts with reserved EXTRA field'
-                            )
                         p_def = f'{field_name} {p_def} `{tags}`'
                         header_fields.append(p_def)
                     case _:
@@ -926,8 +922,8 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
             if len(header_fields) > 0:
                 header_code_lines = []
                 header_code_lines.append('fw.RequestStructHeader[fw.JSONHeaderPreset, struct {')
+                header_code_lines.append(' '*8 + 'fwheader.WithExtras')
                 header_code_lines.extend(_indent(header_fields, ' '*8))
-                header_code_lines.append(' '*8 + 'EXTRA http.Header')
                 header_code_lines.append(' '*4 + '}]')
                 header_code = '\n'.join(header_code_lines)
             else:
@@ -1005,7 +1001,7 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
             imports_lines = ['import (']
             imports_lines.append(' '*4 + f'"{FW_IMPORT_PATH}"')
             if len(header_fields) > 0:
-                imports_lines.append(' '*4 + '"net/http"')
+                imports_lines.append(' '*4 + f'"{FW_IMPORT_PATH}/fwheader"')
             imports_lines.append(')')
             imports_code = '\n'.join(imports_lines)
 
