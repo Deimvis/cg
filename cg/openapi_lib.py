@@ -925,7 +925,7 @@ def handle_api_file(openapi_api_fp: Path, output_dir: Path, output_lang: Program
 
             if len(header_fields) > 0:
                 header_code_lines = []
-                header_code_lines.append('fw.RequestStructHeader[struct {')
+                header_code_lines.append('fw.RequestStructHeader[fw.JSONHeaderPreset, struct {')
                 header_code_lines.extend(_indent(header_fields, ' '*8))
                 header_code_lines.append(' '*8 + 'EXTRA http.Header')
                 header_code_lines.append(' '*4 + '}]')
