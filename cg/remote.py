@@ -446,7 +446,7 @@ def _attempt_fetch(
         except (urllib.error.URLError, TimeoutError) as e:
             reason = getattr(e, "reason", e)
             is_timeout = isinstance(e, TimeoutError) or isinstance(reason, TimeoutError)
-            if is_timeout or attempt == _FETCH_MAX_ATTEMPTS - 1:
+            if attempt == _FETCH_MAX_ATTEMPTS - 1:
                 lines = []
                 ref_from = _format_source(source)
                 if ref_from is not None:
@@ -455,17 +455,18 @@ def _attempt_fetch(
                 if request_url != canonical:
                     lines.append(f"  requested: {request_url}")
                 lines.append(f"  host:      {connect_host}")
-                if not is_timeout and attempt > 0:
+                if attempt > 0:
                     lines.append(f"  attempts:  {attempt + 1}")
                 details = "\n".join(lines)
                 if is_timeout:
                     raise SystemExit(
-                        f"fetch timed out after {_FETCH_TIMEOUT_S}s\n{details}"
+                        f"fetch timed out after {_FETCH_TIMEOUT_S}s per attempt\n{details}"
                     )
                 raise SystemExit(
                     f"fetch failed: {type(e).__name__}: {reason}\n{details}"
                 )
-            time.sleep(_FETCH_RETRY_BACKOFF_S[attempt])
+            if not is_timeout:
+                time.sleep(_FETCH_RETRY_BACKOFF_S[attempt])
 
     basename = os.path.basename(parsed.path) or "remote.yaml"
     if "html" in content_type.lower() and basename.endswith(".yaml"):
